@@ -870,7 +870,7 @@ function Module.Build(ctx)
 	petsLeft:Button({
 		Name = "Equip Best Now",
 		Callback = function()
-			equipBest()
+			task.spawn(equipBest)
 		end,
 	})
 
@@ -883,14 +883,21 @@ function Module.Build(ctx)
 		Default = false,
 		Callback = function(state)
 			F.petsAutoSell = state
-			pcall(Network.Invoke, NET.Backpack.SET_AUTO_SELL_STATE, state)
+			-- Spawned, like every other call out of a control. Network.Invoke is a
+			-- round trip, and a callback that yields blocks the interface thread that
+			-- called it.
+			task.spawn(function()
+				pcall(Network.Invoke, NET.Backpack.SET_AUTO_SELL_STATE, state)
+			end)
 		end,
 	}, "petsAutoSell")
 
 	petsRight:Button({
 		Name = "Sell Everything",
 		Callback = function()
-			pcall(Network.Invoke, NET.AssetInventory.SELL_ALL_ASSETS)
+			task.spawn(function()
+				pcall(Network.Invoke, NET.AssetInventory.SELL_ALL_ASSETS)
+			end)
 		end,
 	})
 
@@ -921,8 +928,10 @@ function Module.Build(ctx)
 	progLeft:Button({
 		Name = "Rebirth Now",
 		Callback = function()
-			pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH)
-			pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH_COMMIT)
+			task.spawn(function()
+				pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH)
+				pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH_COMMIT)
+			end)
 		end,
 	})
 
@@ -1261,47 +1270,96 @@ function Module.Build(ctx)
 	----------------------------------------------------------------------------
 
 	-- The hub's own ESP wants models with humanoids in them, which an egg in a
-	-- nest is not, and the snapshot already knows where every egg is to the
-	-- stud. So this draws from the same ranked list the farm reads: whatever
-	-- the label says is the best egg is the one the farm is about to walk to,
-	-- because there is only one list.
+	-- nest is not. This draws from the same ranked list the farm reads, so
+	-- whatever the label says is the best egg is the one the farm is about to
+	-- walk to. There is only one list and it cannot disagree with itself.
 	--
-	-- Colour is the rank, not the rarity. Rarity is what the game already shows
-	-- you on the nest; what it does not show you is that this Pterodactyl is
-	-- worth twenty times the one behind you because of its size.
-	local espHolder = nil
-	local espMarks = {}
+	-- Colour is the rank, not the rarity. Rarity is already on the nest; what
+	-- the game does not show you is that this Pterodactyl is worth twenty times
+	-- the one behind you because of its size.
+	--
+	-- Every egg is a real model, `Workspace.AreaEggSlotsClient.<uid>`, so this
+	-- adorns to those rather than parking parts of its own in the world. The
+	-- first attempt did the latter and they silently never appeared: something
+	-- in this game sweeps instances it did not put in Workspace, and a folder
+	-- parented there is gone before the next frame without an error.
+	--
+	-- **The whole pool is built here and never grows.** A loop thread is
+	-- resumed by the engine after it waits, and a resumed thread cannot call
+	-- Instance.new at all - it fails with "the current thread cannot access
+	-- Instance" every tick, forever, and the ESP silently draws nothing. So the
+	-- billboards are made once, on the build thread, and the loop only ever
+	-- points them at things. It is also simply better: no allocation twice a
+	-- second and nothing for the collector to chase.
+	local EGG_MODELS = "AreaEggSlotsClient"
+	local ESP_POOL = 60
+
+	local espHolder = Instance.new("Folder")
+	espHolder.Name = "MeridianEggs"
+	espHolder.Parent = (gethui and gethui()) or game:GetService("CoreGui")
+	core:Track(espHolder)
+
+	local espPool = {}
+	for _ = 1, ESP_POOL do
+		local billboard = Instance.new("BillboardGui")
+		billboard.Size = UDim2.fromOffset(240, 34)
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
+		billboard.AlwaysOnTop = true
+		billboard.Enabled = false
+		billboard.Parent = espHolder
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamMedium
+		label.TextSize = 15
+		label.TextStrokeTransparency = 0.4
+		label.Parent = billboard
+
+		local highlight = Instance.new("Highlight")
+		highlight.FillTransparency = 0.85
+		highlight.OutlineTransparency = 0.2
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.Enabled = false
+		highlight.Parent = espHolder
+
+		espPool[#espPool + 1] = { billboard = billboard, label = label, highlight = highlight }
+	end
 
 	local function espColour(worth, best)
 		if best <= 0 then
 			return Color3.fromRGB(235, 235, 235)
 		end
+		-- A root rather than a straight ratio, because one Cosmic egg on the map
+		-- makes every other worth a fraction of a percent of it, and a linear
+		-- ramp would paint everything else the same grey.
 		local part = math.clamp(worth / best, 0, 1) ^ 0.4
 		return Color3.fromRGB(150, 150, 150):Lerp(Color3.fromRGB(120, 255, 190), part)
 	end
 
-	local function clearEggEsp()
-		for uid, mark in pairs(espMarks) do
-			pcall(function()
-				mark.anchor:Destroy()
-			end)
-			espMarks[uid] = nil
+	local function hideFrom(index)
+		for slot = index, ESP_POOL do
+			local mark = espPool[slot]
+			if not mark.billboard.Enabled and not mark.highlight.Enabled then
+				break
+			end
+			mark.billboard.Enabled = false
+			mark.highlight.Enabled = false
+			mark.billboard.Adornee = nil
+			mark.highlight.Adornee = nil
 		end
 	end
 
 	core:Loop("eggEsp", 0.3, function()
 		if not F.eggEsp then
-			if next(espMarks) then
-				clearEggEsp()
-			end
+			hideFrom(1)
 			return
 		end
 
-		if not espHolder or not espHolder.Parent then
-			espHolder = Instance.new("Folder")
-			espHolder.Name = "\0MeridianEggs"
-			espHolder.Parent = Workspace
-			core:Track(espHolder)
+		local models = Workspace:FindFirstChild(EGG_MODELS)
+		if not models then
+			hideFrom(1)
+			return
 		end
 
 		local ranked = rankedEggs()
@@ -1309,66 +1367,44 @@ function Module.Build(ctx)
 		local floor = F.eggEspFilter ~= false and (tonumber(F.stealFloor) or 0) or 0
 		local best = ranked[1] and ranked[1].worth or 0
 
-		local wanted = {}
-		for index, egg in ipairs(ranked) do
-			if egg.distance <= range and egg.worth >= floor and index <= 60 then
-				local uid = egg.record.Uid
-				wanted[uid] = true
-				local mark = espMarks[uid]
-				if not mark then
-					local anchor = Instance.new("Part")
-					anchor.Size = Vector3.new(0.05, 0.05, 0.05)
-					anchor.Transparency = 1
-					anchor.Anchored = true
-					anchor.CanCollide = false
-					anchor.CanQuery = false
-					anchor.CanTouch = false
-					anchor.Parent = espHolder
+		local slot = 0
+		for _, egg in ipairs(ranked) do
+			if slot >= ESP_POOL then
+				break
+			end
+			if egg.distance <= range and egg.worth >= floor then
+				local model = models:FindFirstChild(egg.record.Uid)
+				local anchor = model
+					and (model.PrimaryPart or model:FindFirstChild("Hitbox") or model:FindFirstChildWhichIsA("BasePart"))
+				if anchor then
+					slot = slot + 1
+					local mark = espPool[slot]
 
-					local billboard = Instance.new("BillboardGui")
-					billboard.Size = UDim2.fromOffset(230, 34)
-					billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.4, 0)
-					billboard.AlwaysOnTop = true
-					billboard.Adornee = anchor
-					billboard.Parent = anchor
+					local text = eggName(egg.record)
+					if F.eggEspWorth ~= false then
+						text = text .. " · " .. short(egg.worth)
+					end
+					if #egg.mutations > 0 then
+						text = text .. " · " .. table.concat(egg.mutations, ", ")
+					end
+					if F.eggEspDistance then
+						text = text .. " · " .. math.floor(egg.distance)
+					end
 
-					local label = Instance.new("TextLabel")
-					label.BackgroundTransparency = 1
-					label.Size = UDim2.fromScale(1, 1)
-					label.Font = Enum.Font.GothamMedium
-					label.TextSize = 15
-					label.TextStrokeTransparency = 0.4
-					label.Parent = billboard
-
-					mark = { anchor = anchor, label = label }
-					espMarks[uid] = mark
+					local colour = espColour(egg.worth, best)
+					mark.label.Text = text
+					mark.label.TextColor3 = colour
+					mark.highlight.FillColor = colour
+					mark.highlight.OutlineColor = colour
+					mark.billboard.Adornee = anchor
+					mark.highlight.Adornee = model
+					mark.billboard.Enabled = true
+					mark.highlight.Enabled = true
 				end
-
-				mark.anchor.Position = egg.position
-
-				local text = eggName(egg.record)
-				if F.eggEspWorth ~= false then
-					text = text .. " · " .. short(egg.worth)
-				end
-				if #egg.mutations > 0 then
-					text = text .. " · " .. table.concat(egg.mutations, ", ")
-				end
-				if F.eggEspDistance then
-					text = text .. " · " .. math.floor(egg.distance)
-				end
-				mark.label.Text = text
-				mark.label.TextColor3 = espColour(egg.worth, best)
 			end
 		end
 
-		for uid, mark in pairs(espMarks) do
-			if not wanted[uid] then
-				pcall(function()
-					mark.anchor:Destroy()
-				end)
-				espMarks[uid] = nil
-			end
-		end
+		hideFrom(slot + 1)
 	end)
 
 	----------------------------------------------------------------------------
@@ -1419,7 +1455,17 @@ function Module.Build(ctx)
 		end
 	end)
 
-	refreshSnapshot()
+	-- Off the build thread, deliberately, and this is not a style choice.
+	--
+	-- RequestAreaEggSnapshot is a RemoteFunction round trip, so it yields, and a
+	-- thread that yields is resumed by the engine without the capability to touch
+	-- the interface. Build is called part way through the loader putting the
+	-- window together, so yielding here killed the next line of main.luau with
+	-- "the current thread cannot access Instance" and left the loading bar frozen
+	-- at ninety-two percent. **Nothing in Build may yield.** The game's own
+	-- signals fill the cache in anyway; this only shortens the wait for the first
+	-- one.
+	task.spawn(refreshSnapshot)
 
 	-- main.luau selects the default tab itself, after the chrome is on. Doing it
 	-- from in here runs the tab transition before the window is finished and
