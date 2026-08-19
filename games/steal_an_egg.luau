@@ -16,6 +16,7 @@
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
 local HttpService = game:GetService("HttpService")
 local TeleportService = game:GetService("TeleportService")
 
@@ -611,6 +612,10 @@ function Module.Build(ctx)
 		started = os.clock(),
 	}
 
+	-- Assigned by the walker further down, which is defined after this.
+	local clearRoute
+	local stopWalking
+
 	local currentTarget = nil
 	local targetSince = 0
 	local nextAttempt = 0
@@ -626,7 +631,7 @@ function Module.Build(ctx)
 
 	local function dropTarget()
 		currentTarget = nil
-		core:SetControls(true)
+		clearRoute()
 		-- Whatever the last egg refused for was about that egg. Starting the next
 		-- one already throttled is how a farm talks itself into standing still.
 		accepted("carry")
@@ -689,59 +694,173 @@ function Module.Build(ctx)
 		return false
 	end
 
-	-- Walking, and both halves of this were learned the hard way.
+	-- Walking, which turned out to be the hard part of this whole module.
 	--
-	-- **MoveTo gives up after eight seconds.** Aiming it at a nest a thousand
-	-- studs away and leaving it alone looks perfect for eight seconds and then
-	-- the character simply stops, forever, because nothing ever asks again. So
-	-- the order is re-issued, but at a point along the exact bearing to the real
-	-- destination rather than at the destination itself, which keeps the path
-	-- dead straight while staying inside what MoveTo will actually finish.
+	-- Three things had to be true at once and each one broke it alone.
 	--
-	-- **And it is re-issued rarely.** The hub's own walker asks twenty times a
-	-- second, which is right when chasing a player who moves; a nest has not
-	-- moved in an hour, and every fresh order interrupts the humanoid's own
-	-- acceleration. In a game whose entire economy is how fast you cover ground,
-	-- that shuffle is the difference between a good farm and a bad one.
-	local WALK_STEP = 60
-	local WALK_REFRESH = 3.5
+	-- **It has to path, not aim.** The base is walled off from the areas. A
+	-- straight line at an egg seven hundred studs away puts the character into
+	-- that wall, where it stands with a MoveTo target nine studs ahead and
+	-- covers no ground at all. That is the "walks for a bit and then stops"
+	-- and no amount of re-aiming fixes it, because the aim was never wrong.
+	--
+	-- **MoveTo gives up after eight seconds**, so a distant target is never
+	-- reached even in open ground.
+	--
+	-- **And it steers rather than re-targeting.** Thirty-four waypoints over a
+	-- hundred studs would mean a fresh order every few studs, and each one
+	-- interrupts the humanoid's own acceleration. It aims at the waypoint about
+	-- fifty studs along instead, which follows the same route at a run.
+	local PathfindingService = game:GetService("PathfindingService")
 
-	local walkOrder = { at = 0, aim = nil }
+	local WALK_LOOKAHEAD = 50
+	local WAYPOINT_REACHED = 8
+	local ROUTE_MOVED = 25
+	local ROUTE_RETRY = 2
 
-	local function walkTo(position, standoff)
+	local route = { goal = nil, points = nil, index = 1, busy = false, failedAt = 0 }
+
+	function clearRoute()
+		route.goal, route.points, route.index = nil, nil, 1
+	end
+
+	-- ComputeAsync yields, and the farm loop must never yield, so the path is
+	-- worked out on its own thread and the loop just reads whatever is ready.
+	local function planRoute(goal)
+		if route.busy or os.clock() - route.failedAt < ROUTE_RETRY then
+			return
+		end
+		route.busy = true
+		task.spawn(function()
+			local root = core:Root()
+			if root then
+				local path = PathfindingService:CreatePath({
+					AgentRadius = 3,
+					AgentHeight = 6,
+					AgentCanJump = true,
+					AgentMaxSlope = 60,
+				})
+				local ok = pcall(function()
+					path:ComputeAsync(root.Position, goal)
+				end)
+				if ok and path.Status == Enum.PathStatus.Success then
+					route.goal = goal
+					route.points = path:GetWaypoints()
+					-- The first waypoint is where we already are.
+					route.index = math.min(2, #route.points)
+				else
+					clearRoute()
+					route.failedAt = os.clock()
+				end
+			end
+			route.busy = false
+		end)
+	end
+
+	local function flatDistance(a, b)
+		return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
+	end
+
+	-- The waypoint about fifty studs along from here, so the order is given
+	-- rarely and the path is still followed.
+	local function lookAhead(from)
+		local points = route.points
+		if not points then
+			return nil
+		end
+		while route.index < #points and flatDistance(points[route.index].Position, from) <= WAYPOINT_REACHED do
+			route.index = route.index + 1
+		end
+		local run, pick = 0, route.index
+		for i = route.index, #points do
+			pick = i
+			run = run + flatDistance(points[i].Position, i > 1 and points[i - 1].Position or from)
+			if run >= WALK_LOOKAHEAD then
+				break
+			end
+		end
+		return points[pick], points[route.index]
+	end
+
+	-- And the movement itself is Humanoid:Move on a render step, not MoveTo.
+	--
+	-- The game's ControlModule binds to RenderStep at Input priority and calls
+	-- Humanoid:Move every frame with whatever the keyboard says, which is zero
+	-- when nobody is holding a key. That cancels any MoveTo instantly, so the
+	-- character stood still with a perfectly good target nine studs ahead.
+	--
+	-- Disabling the control module works when you can reach it, and often you
+	-- cannot: PlayerScripts is missing outright for a while after a rejoin, and
+	-- "PlayerScripts is not a valid member of Player" is not something a farm
+	-- should depend on not happening. So instead of switching their steering
+	-- off, this runs one step later in the same frame and steers itself. Same
+	-- call they make, same frame, ours last.
+	local steer = { direction = nil }
+
+	function stopWalking()
+		steer.direction = nil
+		local hum = core:Humanoid()
+		if hum then
+			pcall(function()
+				hum:Move(Vector3.zero, false)
+			end)
+		end
+	end
+
+	core:Track(function()
+		steer.direction = nil
+		pcall(function()
+			RunService:UnbindFromRenderStep("MeridianSteer")
+		end)
+	end)
+
+	pcall(function()
+		RunService:BindToRenderStep("MeridianSteer", Enum.RenderPriority.Input.Value + 5, function()
+			local hum = core:Humanoid()
+			if not hum or hum.Health <= 0 then
+				return
+			end
+			if steer.direction then
+				hum:Move(steer.direction, false)
+			end
+		end)
+	end)
+
+	local function walkTo(goal, standoff)
 		local root, hum = core:Root(), core:Humanoid()
 		if not root or not hum or hum.Health <= 0 then
+			steer.direction = nil
 			return false
 		end
 
-		local flat = Vector3.new(position.X - root.Position.X, 0, position.Z - root.Position.Z)
-		local distance = flat.Magnitude
-		if distance <= (standoff or 0) then
-			walkOrder.aim = nil
-			core:SetControls(true)
+		if flatDistance(goal, root.Position) <= (standoff or 0) then
+			clearRoute()
+			steer.direction = nil
 			return true
 		end
 
-		core:SetControls(false)
-
-		local now = os.clock()
-		local changed = walkOrder.aim == nil or (position - walkOrder.aim).Magnitude > 10
-		if changed or now - walkOrder.at > WALK_REFRESH then
-			walkOrder.at = now
-			walkOrder.aim = position
-			local reach = math.min(distance - (standoff or 0), WALK_STEP)
-			hum:MoveTo(root.Position + flat.Unit * reach)
+		if not route.goal or (goal - route.goal).Magnitude > ROUTE_MOVED then
+			planRoute(goal)
 		end
+
+		local aim, next_ = lookAhead(root.Position)
+		local target = aim and aim.Position or goal
+
+		-- Jump waypoints have to be acted on as they come up, or the character
+		-- runs at a ledge and stops there.
+		if next_ and next_.Action == Enum.PathWaypointAction.Jump then
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end
+
+		local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
+		if flat.Magnitude < 0.5 then
+			steer.direction = nil
+			return false
+		end
+		steer.direction = flat.Unit
 		return false
 	end
 
-	-- Getting off the treadmill before going anywhere.
-	--
-	-- The treadmill sits fourteen studs from the spawn point, so a farm that has
-	-- just been home is standing on it, and standing on it holds you there: the
-	-- farm issued its walk orders perfectly and did not move a stud for ninety
-	-- seconds. It is also the thing an AFK player is deliberately using, so the
-	-- hub steps off only when it actually has somewhere to be.
 	-- Only when we are actually on it.
 	--
 	-- The first version fired this every few seconds whenever the character had
@@ -838,6 +957,10 @@ function Module.Build(ctx)
 				dropTarget()
 			end
 			stuckFrom = nil
+			-- Switching the farm off has to stop the legs too. It did not, and the
+			-- character carried on walking wherever it had last been pointed, with
+			-- nothing running to ever stop it.
+			stopWalking()
 			return
 		end
 
