@@ -692,8 +692,34 @@ function Module.Build(ctx)
 	-- farm issued its walk orders perfectly and did not move a stud for ninety
 	-- seconds. It is also the thing an AFK player is deliberately using, so the
 	-- hub steps off only when it actually has somewhere to be.
+	-- Only when we are actually on it.
+	--
+	-- The first version fired this every few seconds whenever the character had
+	-- not moved, whatever the reason. It spent ninety seconds telling the server
+	-- to take us off a treadmill we were seventeen studs away from, about thirty
+	-- times, which is precisely the shape of thing that gets an account kicked -
+	-- a request that cannot possibly succeed, repeated.
+	local TREADMILL_RANGE = 12
+
+	local function onTreadmill()
+		local root = core:Root()
+		local data = plotData()
+		local folder = data and data.PlotFolder
+		if not root or not folder then
+			return false
+		end
+		local bottom = folder:FindFirstChild("TreadmillBottom", true)
+		if not bottom or not bottom:IsA("BasePart") then
+			return false
+		end
+		return (bottom.Position - root.Position).Magnitude <= TREADMILL_RANGE
+	end
+
 	local function leaveTreadmill()
-		if due("treadmillOff", 2) then
+		if not onTreadmill() then
+			return
+		end
+		if due("treadmillOff", 4) then
 			pcall(Network.Fire, NET.Treadmills.REQUEST_UNEQUIP)
 		end
 	end
