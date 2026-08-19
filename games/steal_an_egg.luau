@@ -30,6 +30,7 @@ local Module = {
 Module.Tips = {
 	["Auto Steal"] = "Walks to an egg, takes it, brings it home and puts it down. Then goes again.",
 	["Pick By"] = "What makes an egg worth the walk.",
+	["Stay Where You Win"] = "Only goes to areas your Speed is up to, using the recommended number on the sign at the mouth of each one.",
 	["Areas"] = "Which parts of the map it is allowed to go to. Leave them all on and it goes wherever the best egg is.",
 	["Worth At Least"] = "Ignores anything earning less than this. The number is money a second, the same one the game shows on a pet.",
 	["Only Mutated"] = "Skips every ordinary egg, however big.",
@@ -88,7 +89,6 @@ function Module.Build(ctx)
 	local EggCmds = require(Client:WaitForChild("EggCmds"))
 	local PlotCmds = require(Client:WaitForChild("PlotCmds"))
 	local Network = require(Client:WaitForChild("Network"))
-	local EggToolDisplay = require(Client:WaitForChild("Eggs"):WaitForChild("EggToolDisplay"))
 
 	local Constants = require(Library:WaitForChild("Globals"):WaitForChild("Constants"))
 	local NET = Constants.NETWORK_MAP
@@ -179,6 +179,134 @@ function Module.Build(ctx)
 	end
 	table.sort(AREA_NAMES)
 
+	----------------------------------------------------------------------------
+	-- where you are actually allowed to be
+	----------------------------------------------------------------------------
+
+	-- The game already answers this and puts the answer on a sign at the mouth
+	-- of every area: "recommended 700K". That number is Speed Power, the stat on
+	-- your screen, and it is the only honest gate.
+	--
+	--   Forest 11 · Lake 900 · Desert 10K · Jungle 40K · Snow 170K
+	--   Volcano 700K · Abyss Ocean 2.5M · Prehistoric 17M · Cosmic 700M
+	--
+	-- The first version of this compared your WalkSpeed against the guard's
+	-- WalkSpeed instead, which is a different scale and got Volcano wrong: it
+	-- called an area shut that he clears comfortably. Read the sign.
+	local AREA_MODELS = "GuardAreas"
+
+	local function parseSpeed(text)
+		if type(text) ~= "string" then
+			return nil
+		end
+		local number, suffix = text:match("([%d%.]+)%s*([KMBT]?)")
+		local value = tonumber(number)
+		if not value then
+			return nil
+		end
+		local scale = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
+		return value * (scale[suffix] or 1)
+	end
+
+	-- Read on demand rather than once at build, and that matters. The hub loads
+	-- before the world has finished streaming in, so reading the signs up front
+	-- found nothing, every area came back allowed, and the farm walked straight
+	-- into Prehistoric with a tenth of the Speed it wants. It keeps trying until
+	-- it has all nine.
+	local AREA_NEEDS = {}
+	local areaNeedsCount = 0
+
+	local function readSigns()
+		if areaNeedsCount >= 9 then
+			return
+		end
+		local objects = Workspace:FindFirstChild("__OBJECTS")
+		local areasFolder = objects and objects:FindFirstChild("Areas")
+		local guardAreas = areasFolder and areasFolder:FindFirstChild(AREA_MODELS)
+		for _, model in ipairs(guardAreas and guardAreas:GetChildren() or {}) do
+			if AREA_NEEDS[model.Name] == nil then
+				local sign = model:FindFirstChild("RequiredSpeedSign")
+				for _, label in ipairs(sign and sign:GetDescendants() or {}) do
+					if label:IsA("TextLabel") and label.Name == "Speed" then
+						local needed = parseSpeed(label.Text)
+						if needed then
+							AREA_NEEDS[model.Name] = needed
+							areaNeedsCount = areaNeedsCount + 1
+						end
+						break
+					end
+				end
+			end
+		end
+	end
+
+	local SpeedPower = require(Client:WaitForChild("SpeedPowerProjection"))
+
+	-- The way in, and the reason a farm can stand two studs from an egg for
+	-- twenty seconds without taking it.
+	--
+	-- Areas are fenced. Walking at an egg's coordinates from outside puts you
+	-- against the fence, close enough for the distance check to read two studs
+	-- and still outside, so every request comes back "Enter the gameplay area
+	-- first" and nothing ever changes. Each area model carries a Bounds pad and
+	-- a ClosestExitPoint, which is also the way in, so the approach goes through
+	-- the door before it goes to the egg.
+	local function areaModel(areaId)
+		local objects = Workspace:FindFirstChild("__OBJECTS")
+		local areasFolder = objects and objects:FindFirstChild("Areas")
+		local guardAreas = areasFolder and areasFolder:FindFirstChild(AREA_MODELS)
+		return guardAreas and guardAreas:FindFirstChild(areaId) or nil
+	end
+
+	local function insideArea(areaId, position)
+		local model = areaModel(areaId)
+		local bounds = model and model:FindFirstChild("Bounds")
+		if not bounds or not bounds:IsA("BasePart") then
+			return true
+		end
+		local relative = bounds.CFrame:PointToObjectSpace(position)
+		local half = bounds.Size / 2
+		return math.abs(relative.X) <= half.X and math.abs(relative.Z) <= half.Z
+	end
+
+	-- A point a little way inside the fence rather than on it, so arriving does
+	-- not leave you straddling the line.
+	local function areaEntrance(areaId)
+		local model = areaModel(areaId)
+		if not model then
+			return nil
+		end
+		local door = model:FindFirstChild("ClosestExitPoint")
+		local bounds = model:FindFirstChild("Bounds")
+		if not door or not door:IsA("BasePart") then
+			return bounds and bounds:IsA("BasePart") and bounds.Position or nil
+		end
+		if bounds and bounds:IsA("BasePart") then
+			local inward = (bounds.Position - door.Position)
+			if inward.Magnitude > 1 then
+				return door.Position + inward.Unit * 14
+			end
+		end
+		return door.Position
+	end
+
+	local function mySpeedPower()
+		local ok, value = pcall(SpeedPower.GetSpeedPower)
+		return (ok and tonumber(value)) or 0
+	end
+
+	local function canHandle(areaId)
+		readSigns()
+		local needed = AREA_NEEDS[areaId]
+		if not needed then
+			-- No sign read yet is not permission. Until the world has streamed in
+			-- far enough to say, the only areas worth trusting are the cheap ones,
+			-- and being wrong here costs a wasted trip and a stolen egg.
+			return areaNeedsCount > 0
+		end
+		return mySpeedPower() >= needed
+	end
+
 	local function eggPosition(record)
 		local cframe = record.BoundsCFrame or record.BottomCFrame
 		return cframe and cframe.Position or nil
@@ -204,21 +332,57 @@ function Module.Build(ctx)
 	-- What we are carrying, if anything. The tool is the truth: the server put
 	-- it in our hands, so it cannot disagree with itself the way a local flag
 	-- can after a refusal we misread.
-	local function carriedUid()
-		local character = core:Character()
-		for _, holder in ipairs({ character, LocalPlayer:FindFirstChildOfClass("Backpack") }) do
-			if holder then
-				for _, item in ipairs(holder:GetChildren()) do
-					if item:IsA("Tool") then
-						local ok, uid = pcall(EggToolDisplay.GetToolUid, item)
-						if ok and uid then
-							return uid, item
-						end
-					end
-				end
-			end
+	----------------------------------------------------------------------------
+	-- talking to the server
+	----------------------------------------------------------------------------
+
+	-- Nothing in this module calls the server except through here, and that is
+	-- not tidiness. The first version retried a refused placement on every tick
+	-- of a loop that runs ten times a second, which is six hundred identical
+	-- requests a minute from one client, and it got the account kicked for
+	-- cheating inside a minute. **A refusal retried immediately is the loudest
+	-- thing a script can do**, far louder than the farm walking around.
+	--
+	-- So: a floor under the gap between any two calls at all, a per-action
+	-- interval on top of that, and a doubling wait after each refusal.
+	local SERVER_GAP = 0.45
+	local BACKOFF_CAP = 30
+
+	-- The ceiling is per action, and that is not a detail. Carrying backed off to
+	-- thirty seconds after a handful of refusals and nothing cleared the count,
+	-- so the farm stood next to an egg it was perfectly able to take and asked
+	-- once a minute. A slow action can afford to wait. The one the farm is built
+	-- around cannot.
+	local BACKOFF_MAX = { carry = 4 }
+
+	local lastCall = 0
+	local nextDue = {}
+	local failures = {}
+
+	local function due(key, interval)
+		local now = os.clock()
+		if now - lastCall < SERVER_GAP then
+			return false
 		end
-		return nil
+		if now < (nextDue[key] or 0) then
+			return false
+		end
+		lastCall = now
+		nextDue[key] = now + interval
+		return true
+	end
+
+	local function refused(key, interval)
+		local count = (failures[key] or 0) + 1
+		failures[key] = count
+		local ceiling = BACKOFF_MAX[key] or BACKOFF_CAP
+		nextDue[key] = os.clock() + math.min(interval * (2 ^ count), ceiling)
+		return count
+	end
+
+	local function accepted(key)
+		failures[key] = nil
+		nextDue[key] = nil
 	end
 
 	----------------------------------------------------------------------------
@@ -255,6 +419,49 @@ function Module.Build(ctx)
 		end
 	end
 
+	-- Carrying is a signal, not a tool, and getting this wrong is what made the
+	-- farm look broken.
+	--
+	-- An area egg you pick up never becomes a Tool in your backpack. The server
+	-- fires AreaEggCarryStateChanged with { IsCarrying, Uid, SpeedMultiplier }
+	-- and the game renders you holding it. The game's own module for this is
+	-- called CarryRunBackEffects, which is the loop in one word.
+	--
+	-- The first version looked for a Tool with a uid on it. Hatched pets are
+	-- Tools with uids, so a full backpack read as "carrying" forever and the
+	-- farm never went for another egg; filtering those out left it recognising
+	-- nothing at all, so it never went home either and just kept hunting with an
+	-- egg in its hands. Both symptoms, one wrong question.
+	local carrying = { active = false, uid = nil, slowedTo = 1 }
+
+	do
+		local signal = EggCmds.AreaEggCarryStateChanged
+		if type(signal) == "table" and signal.Connect then
+			core:Connect(signal, function(state)
+				if type(state) ~= "table" then
+					return
+				end
+				carrying.active = state.IsCarrying == true
+				carrying.uid = carrying.active and state.Uid or nil
+				carrying.slowedTo = tonumber(state.SpeedMultiplier) or 1
+			end)
+		end
+	end
+
+	local function carriedUid()
+		if carrying.active and carrying.uid then
+			return carrying.uid
+		end
+		-- The signal only fires on a change, so a hub loaded while already
+		-- holding one has never heard it. The snapshot knows.
+		for _, record in ipairs(cachedSnapshot().Records) do
+			if record.State == "Carried" and tostring(record.CarrierUserId or record.OwnerUserId or "") == tostring(LocalPlayer.UserId) then
+				return record.Uid
+			end
+		end
+		return nil
+	end
+
 	----------------------------------------------------------------------------
 	-- choosing
 	----------------------------------------------------------------------------
@@ -289,10 +496,11 @@ function Module.Build(ctx)
 				local distance = (position - me).Magnitude
 				local worth = eggWorth(record)
 				local mutations = mutationList(record)
-				local pass = distance <= reach
+						local pass = distance <= reach
 					and worth >= floor
 					and (not allowedSet or allowedSet[record.AreaId])
 					and (not mutatedOnly or #mutations > 0)
+					and (F.stealOutrun == false or canHandle(record.AreaId))
 				if pass then
 					out[#out + 1] = {
 						record = record,
@@ -369,6 +577,9 @@ function Module.Build(ctx)
 	local function dropTarget()
 		currentTarget = nil
 		core:SetControls(true)
+		-- Whatever the last egg refused for was about that egg. Starting the next
+		-- one already throttled is how a farm talks itself into standing still.
+		accepted("carry")
 	end
 
 	-- Somewhere on your own base to put an egg down. The game raycasts from
@@ -394,25 +605,38 @@ function Module.Build(ctx)
 		return data.CenterPoint.CFrame:ToObjectSpace(CFrame.new(world))
 	end
 
+	-- Six refusals in a row is a base that is full or an egg the game will not
+	-- take, not a spot that was unlucky. Past that it stops asking rather than
+	-- asking louder.
+	local PLACE_INTERVAL = 1.2
+	local PLACE_GIVE_UP = 6
+
 	local function tryPlace(uid)
+		if not due("place", PLACE_INTERVAL) then
+			return false
+		end
 		local data = plotData()
 		if not data or not data.CenterPoint then
+			refused("place", PLACE_INTERVAL)
 			return false, "No base yet"
 		end
 		local localCFrame = placementCFrame(data)
 		if not localCFrame then
+			refused("place", PLACE_INTERVAL)
 			return false, "No base yet"
 		end
-		local ok, accepted, reason = pcall(EggCmds.RequestPlaceEgg, uid, localCFrame)
-		if not ok then
-			return false, tostring(accepted)
-		end
-		if accepted then
+		local ok, took, reason = pcall(EggCmds.RequestPlaceEgg, uid, localCFrame)
+		if ok and took then
+			accepted("place")
 			placeAttempt = 0
 			stats.placed = stats.placed + 1
 			return true
 		end
-		return false, reason
+		local count = refused("place", PLACE_INTERVAL)
+		if count >= PLACE_GIVE_UP then
+			return false, tostring(ok and reason or took), true
+		end
+		return false
 	end
 
 	-- Carrying an egg home. Everything about this is deliberately ordinary
@@ -458,11 +682,12 @@ function Module.Build(ctx)
 			if F.basePlace == false then
 				return
 			end
-			local placed, reason = tryPlace(held)
-			if not placed and reason then
-				-- The pad filling up is the one refusal worth saying out loud,
-				-- because it is the one the user has to do something about.
-				sayOnce("place", "Could not place", tostring(reason))
+			local placed, reason, gaveUp = tryPlace(held)
+			if not placed and gaveUp then
+				-- A base that is full is the one refusal the user has to do
+				-- something about, and by this point it has been refused six times,
+				-- so it is not bad luck.
+				sayOnce("place", "Could not place it", tostring(reason))
 			end
 			return
 		end
@@ -490,9 +715,23 @@ function Module.Build(ctx)
 			currentTarget = best
 			targetSince = os.clock()
 			nextAttempt = 0
+			accepted("carry")
 		end
 
 		local position = eggPosition(currentTarget.record) or currentTarget.position
+		local me = myPosition()
+		local areaId = currentTarget.record.AreaId
+
+		-- Through the door first. Nothing about the egg matters until we are on
+		-- the right side of the fence.
+		if me and not insideArea(areaId, me) then
+			local door = areaEntrance(areaId)
+			if door then
+				core:WalkToward(door, 4, tonumber(F.stealSpeed) or 200)
+				return
+			end
+		end
+
 		local arrived = core:WalkToward(position, STEAL_REACH, tonumber(F.stealSpeed) or 200)
 		if not arrived then
 			return
@@ -501,13 +740,21 @@ function Module.Build(ctx)
 		if os.clock() < nextAttempt then
 			return
 		end
+		if not due("carry", math.max(tonumber(F.stealDelay) or 0.2, 0.5)) then
+			return
+		end
 		nextAttempt = os.clock() + (tonumber(F.stealDelay) or 0.2)
 
 		-- The wrapper raises rather than returning false when the server says
 		-- no, and the message it raises is the server's own wording, so this is
 		-- the one place in the hub where an error is the useful reply.
-		local ok, err = pcall(EggCmds.RequestCarryAreaEgg, currentTarget.record.Uid)
-		if ok then
+		-- It refuses two different ways depending on why. Out of reach comes back
+		-- as a plain false with a reason; some others are raised. Treating pcall
+		-- succeeding as the egg being taken counted every refusal as a win, which
+		-- is why the farm reported nothing and stood still.
+		local ok, took, reason = pcall(EggCmds.RequestCarryAreaEgg, currentTarget.record.Uid)
+		if ok and took ~= false then
+			accepted("carry")
 			stats.taken = stats.taken + 1
 			stats.earned = stats.earned + currentTarget.worth
 			core:Notify(
@@ -522,11 +769,22 @@ function Module.Build(ctx)
 			return
 		end
 
-		local message = tostring(err)
+		local message = tostring(ok and reason or took)
 		if message:find("Enter the gameplay area") then
-			-- Standing at the edge of an area is a different refusal from
-			-- standing too far from the egg, and walking closer fixes it, so it
-			-- is worth one more step rather than a new target.
+			-- Refused because we are outside the fence, which the approach above
+			-- is meant to have prevented. Back off rather than asking again on
+			-- the next tick, and give up on this one if it keeps happening.
+			if refused("carry", 1) >= 4 then
+				dropTarget()
+			end
+			return
+		end
+
+		-- Starter area eggs are addressed by a compound key and come back "Egg
+		-- not found" when asked for the ordinary way. They are also the cheapest
+		-- things on the map, so there is nothing to gain by solving it.
+		if message:find("Egg not found") then
+			dropTarget()
 			return
 		end
 		sayOnce("refuse", "Could not take it", message:gsub("^.-:%d+:%s*", ""))
@@ -555,34 +813,48 @@ function Module.Build(ctx)
 		return out
 	end
 
+	-- One egg per pass, not every egg every pass. A full base is twenty-odd
+	-- eggs, and hatching them in one burst is twenty requests inside a frame
+	-- from a client that is supposed to be pressing a button. They hatch just as
+	-- fast spread out, because the growth timer is the thing that takes minutes.
 	core:Loop("base", 2, function()
-		if F.baseHatch then
+		if F.baseHatch and due("hatch", 2.5) then
 			for _, record in ipairs(ownEggs()) do
 				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, record.Uid))
 				if ready == true then
 					pcall(EggCmds.RequestHatchEgg, record.Uid)
-					task.wait(0.35)
+					task.wait(0.5)
 					pcall(EggCmds.RequestCompleteHatchEgg, record.Uid)
+					break
 				end
 			end
 		end
 
-		if F.baseSkip then
+		-- Skipping costs money and the server refuses when you cannot afford it,
+		-- so this is the one most likely to be refused over and over. One egg,
+		-- slowly, and the gate backs it off further every time it is turned down.
+		if F.baseSkip and due("skip", 4) then
 			for _, record in ipairs(ownEggs()) do
 				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, record.Uid))
 				if ready ~= true then
-					pcall(EggCmds.RequestSkipGrowth, record.Uid)
+					local ok, took = pcall(EggCmds.RequestSkipGrowth, record.Uid)
+					if ok and took ~= false then
+						accepted("skip")
+					else
+						refused("skip", 4)
+					end
+					break
 				end
 			end
 		end
 
-		if F.baseUpgrade then
+		if F.baseUpgrade and due("upgrade", 20) then
 			pcall(Network.Invoke, NET.Plots.REQUEST_BASE_UPGRADE)
 		end
 	end)
 
 	core:Loop("offline", 10, function()
-		if F.baseOffline then
+		if F.baseOffline and due("offline", 90) then
 			pcall(Network.Invoke, NET.OfflineAssets.REQUEST_REDEEM)
 		end
 	end)
@@ -596,7 +868,7 @@ function Module.Build(ctx)
 	end
 
 	core:Loop("pets", 6, function()
-		if F.petsEquipBest then
+		if F.petsEquipBest and due("equipBest", 30) then
 			equipBest()
 		end
 	end)
@@ -611,7 +883,7 @@ function Module.Build(ctx)
 	-- movement anti-cheat will accept. A developed account already walks at
 	-- around 98, six times the default, entirely legitimately.
 	core:Loop("speed", 5, function()
-		if F.speedUpgrade then
+		if F.speedUpgrade and due("treadmill", 20) then
 			pcall(Network.Invoke, NET.Treadmills.REQUEST_UPGRADE)
 		end
 	end)
@@ -621,24 +893,405 @@ function Module.Build(ctx)
 	----------------------------------------------------------------------------
 
 	core:Loop("progress", 8, function()
-		if F.progIndex then
+		if F.progIndex and due("index", 60) then
 			pcall(Network.Invoke, NET.Index.REQUEST_CLAIM_ALL)
 		end
-		if F.progGifts then
+		if F.progGifts and due("gifts", 60) then
 			pcall(Network.Invoke, NET.FreeGifts.REQUEST_CLAIM)
 		end
-		if F.progLucky then
+		if F.progLucky and due("lucky", 45) then
 			pcall(Network.Invoke, NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM)
 		end
-		if F.progRebirth then
+		if F.progRebirth and due("rebirth", 60) then
 			pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH)
+			task.wait(0.5)
 			pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH_COMMIT)
 		end
 	end)
 
 	----------------------------------------------------------------------------
-	-- the interface
+	-- moving server
 	----------------------------------------------------------------------------
+
+	-- Lifted whole from Ability Arena, deliberately unchanged. It is the same
+	-- job in both games and a second copy that drifted would be worse than a
+	-- shared one that did not.
+	-- `ping` on this listing is what the server reports for the people already
+	-- in it, not what ours would be. It is a good enough proxy - a server whose
+	-- players are all on 300 is a server on the other side of the world - but it
+	-- is not a promise, which is why the control is a ceiling rather than a
+	-- target.
+	local SERVER_LIST = "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100"
+	local hopping = false
+
+	local function bestServer()
+		local ok, body = pcall(function()
+			return game:HttpGet(SERVER_LIST:format(game.PlaceId))
+		end)
+		if not ok then
+			return nil, "Could not read the server list"
+		end
+
+		local read, decoded = pcall(function()
+			return HttpService:JSONDecode(body)
+		end)
+		if not read or type(decoded) ~= "table" then
+			return nil, "The server list came back unreadable"
+		end
+
+		local mode = F.hopPick or "Full and Fast"
+		local ceiling = tonumber(F.hopPing) or 250
+		local best, bestScore, tooSlow = nil, -math.huge, 0
+
+		for _, server in ipairs(decoded.data or {}) do
+			local seats = tonumber(server.maxPlayers) or 0
+			local playing = tonumber(server.playing) or 0
+			if playing < seats and server.id ~= game.JobId then
+				local ping = tonumber(server.ping) or 0
+				if ping > ceiling then
+					tooSlow += 1
+				else
+					local score
+					if mode == "Most Players" then
+						score = playing
+					elseif mode == "Lowest Ping" then
+						score = -ping
+					else
+						-- How full it is against how slow it is. Full counts for
+						-- a hundred, so a quarter of the ping puts a 60 ms
+						-- server four fifths full ahead of a 200 ms one that is
+						-- completely full.
+						score = (playing / math.max(seats, 1)) * 100 - ping / 4
+					end
+					if score > bestScore then
+						best, bestScore = server, score
+					end
+				end
+			end
+		end
+
+		if not best then
+			if tooSlow > 0 then
+				return nil, ("Every server with room was slower than %d ms"):format(ceiling)
+			end
+			return nil, "No other server had room"
+		end
+		return best
+	end
+
+	local function hopNow(why)
+		if hopping then
+			return
+		end
+		hopping = true
+		task.spawn(function()
+			local server, trouble = bestServer()
+			if not server then
+				core:Notify(Module.Name, trouble or "Nowhere to move to", 4)
+				hopping = false
+				return
+			end
+			core:Notify(
+				Module.Name,
+				("%s. Moving to a %d of %d server on %d ms"):format(
+					why or "Changing server",
+					tonumber(server.playing) or 0,
+					tonumber(server.maxPlayers) or 0,
+					math.floor(tonumber(server.ping) or 0)
+				),
+				5
+			)
+			-- Long enough for that to be readable before the screen goes.
+			task.wait(1.2)
+			-- Queue the hub to load itself again on the other side. A teleport
+			-- ends the script that started it, so without this the farm arrives
+			-- somewhere busier with nothing running.
+			if type(core.QueueRelaunch) == "function" then
+				core.QueueRelaunch()
+			end
+			local sent = pcall(function()
+				TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, Players.LocalPlayer)
+			end)
+			if not sent then
+				core:Notify(Module.Name, "The game refused the move", 4)
+			end
+			-- A teleport that is accepted takes several seconds to happen. This
+			-- stops the loop below firing another one into the gap.
+			task.wait(10)
+			hopping = false
+		end)
+	end
+
+
+	local quietSince = nil
+	local arrived = core.ArrivedAt or os.clock()
+
+	core:Loop("serverHop", 3, function()
+		if not F.autoHop or hopping then
+			quietSince = nil
+			return
+		end
+		-- Players replicate in over the first second or two of a join, so a
+		-- server you have only just arrived in always looks empty. Without this
+		-- the first hop starts a chain that never stops.
+		if os.clock() - arrived < 20 then
+			quietSince = nil
+			return
+		end
+		local here = #Players:GetPlayers()
+		if here >= (tonumber(F.hopBelow) or 4) then
+			quietSince = nil
+			return
+		end
+		quietSince = quietSince or os.clock()
+		if os.clock() - quietSince < 6 then
+			return
+		end
+		quietSince = nil
+		hopNow(("Only %d left here"):format(here))
+	end)
+
+	----------------------------------------------------------------------------
+	-- egg ESP
+	----------------------------------------------------------------------------
+
+	-- The hub's own ESP wants models with humanoids in them, which an egg in a
+	-- nest is not. This draws from the same ranked list the farm reads, so
+	-- whatever the label says is the best egg is the one the farm is about to
+	-- walk to. There is only one list and it cannot disagree with itself.
+	--
+	-- Colour is the rank, not the rarity. Rarity is already on the nest; what
+	-- the game does not show you is that this Pterodactyl is worth twenty times
+	-- the one behind you because of its size.
+	--
+	-- Every egg is a real model, `Workspace.AreaEggSlotsClient.<uid>`, so this
+	-- adorns to those rather than parking parts of its own in the world. The
+	-- first attempt did the latter and they silently never appeared: something
+	-- in this game sweeps instances it did not put in Workspace, and a folder
+	-- parented there is gone before the next frame without an error.
+	--
+	-- **The whole pool is built here and never grows.** A loop thread is
+	-- resumed by the engine after it waits, and a resumed thread cannot call
+	-- Instance.new at all - it fails with "the current thread cannot access
+	-- Instance" every tick, forever, and the ESP silently draws nothing. So the
+	-- billboards are made once, on the build thread, and the loop only ever
+	-- points them at things. It is also simply better: no allocation twice a
+	-- second and nothing for the collector to chase.
+	local EGG_MODELS = "AreaEggSlotsClient"
+	local ESP_POOL = 60
+
+	-- PlayerGui rather than the hidden container the rest of the hub lives in,
+	-- and this was measured rather than chosen. A loop thread here can write to
+	-- the world all day - the farm walks, and that is Instance writes on the
+	-- character - but it cannot write to anything inside gethui(), which needs a
+	-- capability the thread does not have. Every tick warned "the current thread
+	-- cannot access Instance" and the ESP drew nothing at all while the farm ran
+	-- perfectly, in the same module, from the same kind of loop.
+	local espHolder = Instance.new("Folder")
+	espHolder.Name = "MeridianEggs"
+	espHolder.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	core:Track(espHolder)
+
+	local espPool = {}
+	for _ = 1, ESP_POOL do
+		local billboard = Instance.new("BillboardGui")
+		billboard.Size = UDim2.fromOffset(240, 34)
+		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
+		billboard.AlwaysOnTop = true
+		billboard.Enabled = false
+		billboard.Parent = espHolder
+
+		local label = Instance.new("TextLabel")
+		label.BackgroundTransparency = 1
+		label.Size = UDim2.fromScale(1, 1)
+		label.Font = Enum.Font.GothamMedium
+		label.TextSize = 15
+		label.TextStrokeTransparency = 0.4
+		label.Parent = billboard
+
+		local highlight = Instance.new("Highlight")
+		highlight.FillTransparency = 0.85
+		highlight.OutlineTransparency = 0.2
+		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+		highlight.Enabled = false
+		highlight.Parent = espHolder
+
+		espPool[#espPool + 1] = { billboard = billboard, label = label, highlight = highlight }
+	end
+
+	local function espColour(worth, best)
+		if best <= 0 then
+			return Color3.fromRGB(235, 235, 235)
+		end
+		-- A root rather than a straight ratio, because one Cosmic egg on the map
+		-- makes every other worth a fraction of a percent of it, and a linear
+		-- ramp would paint everything else the same grey.
+		local part = math.clamp(worth / best, 0, 1) ^ 0.4
+		return Color3.fromRGB(150, 150, 150):Lerp(Color3.fromRGB(120, 255, 190), part)
+	end
+
+	local function hideFrom(index)
+		for slot = index, ESP_POOL do
+			local mark = espPool[slot]
+			if not mark.billboard.Enabled and not mark.highlight.Enabled then
+				break
+			end
+			mark.billboard.Enabled = false
+			mark.highlight.Enabled = false
+			mark.billboard.Adornee = nil
+			mark.highlight.Adornee = nil
+		end
+	end
+
+	core:Loop("eggEsp", 0.3, function()
+		if not F.eggEsp then
+			hideFrom(1)
+			return
+		end
+
+		local models = Workspace:FindFirstChild(EGG_MODELS)
+		if not models then
+			hideFrom(1)
+			return
+		end
+
+		local ranked = rankedEggs()
+		local range = tonumber(F.eggEspRange) or 2500
+		local floor = F.eggEspFilter ~= false and (tonumber(F.stealFloor) or 0) or 0
+		local best = ranked[1] and ranked[1].worth or 0
+
+		local slot = 0
+		for _, egg in ipairs(ranked) do
+			if slot >= ESP_POOL then
+				break
+			end
+			if egg.distance <= range and egg.worth >= floor then
+				local model = models:FindFirstChild(egg.record.Uid)
+				local anchor = model
+					and (model.PrimaryPart or model:FindFirstChild("Hitbox") or model:FindFirstChildWhichIsA("BasePart"))
+				if anchor then
+					slot = slot + 1
+					local mark = espPool[slot]
+
+					local text = eggName(egg.record)
+					if F.eggEspWorth ~= false then
+						text = text .. " · " .. short(egg.worth)
+					end
+					if #egg.mutations > 0 then
+						text = text .. " · " .. table.concat(egg.mutations, ", ")
+					end
+					if F.eggEspDistance then
+						text = text .. " · " .. math.floor(egg.distance)
+					end
+
+					local colour = espColour(egg.worth, best)
+					mark.label.Text = text
+					mark.label.TextColor3 = colour
+					mark.highlight.FillColor = colour
+					mark.highlight.OutlineColor = colour
+					mark.billboard.Adornee = anchor
+					mark.highlight.Adornee = model
+					mark.billboard.Enabled = true
+					mark.highlight.Enabled = true
+				end
+			end
+		end
+
+		hideFrom(slot + 1)
+	end)
+
+	----------------------------------------------------------------------------
+	-- anti afk
+	----------------------------------------------------------------------------
+
+	-- Everyone in the world except you. In this game the people who matter are
+	-- the ones walking toward your base, so nobody is filtered out by state the
+	-- way the arena filtered out the lobby.
+	core:StartESP({
+		flag = "playerEsp",
+		interval = 0.3,
+		list = function()
+			local out = {}
+			for _, player in ipairs(Players:GetPlayers()) do
+				if player ~= LocalPlayer and player.Character then
+					out[#out + 1] = player.Character
+				end
+			end
+			return out
+		end,
+		maxDistance = function()
+			return tonumber(F.eggEspRange) or 2500
+		end,
+		fill = function()
+			return tonumber(F.playerEspFill) or 0.25
+		end,
+		colour = function()
+			return Color3.fromRGB(235, 235, 235)
+		end,
+		label = function(model, distance)
+			return ("%s · %d"):format(model.Name, math.floor(distance))
+		end,
+	})
+
+	core:Connect(LocalPlayer.Idled, function()
+		if F.antiAfk == false then
+			return
+		end
+		local VirtualUser = game:GetService("VirtualUser")
+		VirtualUser:CaptureController()
+		VirtualUser:ClickButton2(Vector2.new())
+	end)
+
+	----------------------------------------------------------------------------
+	-- what the dashboard shows
+	----------------------------------------------------------------------------
+
+	-- The dashboard reads fixed keys off core.Stats, and core.Headline is the
+	-- one line it shows above them. A game module never touches the interface
+	-- itself, so this is the whole of what it publishes.
+	core:Loop("stats", 1, function()
+		local minutes = math.max((os.clock() - stats.started) / 60, 1 / 60)
+		local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
+		local perSecond = leaderstats and leaderstats:FindFirstChild("Money/s")
+
+		local carried = core.Stats or {}
+		carried.Hits = stats.taken
+		carried.Rate = math.floor(stats.taken / minutes * 60)
+		carried.Total = stats.placed
+		carried.Holding = perSecond and (short(perSecond.Value) .. " a second") or "nothing yet"
+		core.Stats = carried
+
+		local held = carriedUid()
+		if held then
+			core.Headline = "Carrying one home"
+		elseif currentTarget then
+			core.Headline = ("%s · %s a second · %d studs away"):format(
+				eggName(currentTarget.record),
+				short(currentTarget.worth),
+				math.floor(currentTarget.distance)
+			)
+		elseif F.autoSteal then
+			core.Headline = "Looking for something worth the walk"
+		else
+			core.Headline = nil
+		end
+	end)
+
+	----------------------------------------------------------------------------
+	-- the interface, and it is last on purpose
+	----------------------------------------------------------------------------
+	--
+	-- Every loop above this line is registered before a single tab exists, and
+	-- that ordering is load bearing.
+	--
+	-- Maclib yields while it builds elements, and a thread that has yielded
+	-- spawns children that cannot touch an Instance at all. Loops created after
+	-- the tabs therefore run forever without ever drawing anything, warning
+	-- "the current thread cannot access Instance" on every tick. The farm worked
+	-- and the ESP did not, in the same module, for exactly this reason.
+	--
+	-- setthreadidentity does not fix it, because capability is not identity.
+	-- Registering first is the fix.
 
 	local stealTab = tabGroup:Tab({ Name = "Steal", Image = "rbxassetid://10723407389" })
 	local baseTab = tabGroup:Tab({ Name = "Base", Image = "rbxassetid://10734886735" })
@@ -712,10 +1365,7 @@ function Module.Build(ctx)
 	-- Deliberately not a slider you can push past what the game gives you. In
 	-- this game the server owns WalkSpeed outright, so a hub that offered a
 	-- speed number would be selling something it cannot deliver.
-	stealLeft:Paragraph({
-		Header = "About walking",
-		Body = "This game will not let anyone move faster than anyone else, so the farm walks. Your Speed stat is the only thing that changes that, and the Progress tab grows it.",
-	})
+
 
 	-------------------------------------------------------------- steal · right
 
@@ -731,6 +1381,14 @@ function Module.Build(ctx)
 			F.stealPick = value
 		end,
 	}, "stealPick")
+
+	stealRight:Toggle({
+		Name = "Stay Where You Win",
+		Default = true,
+		Callback = function(state)
+			F.stealOutrun = state
+		end,
+	}, "stealOutrun")
 
 	stealRight:Dropdown({
 		Name = "Areas",
@@ -1035,35 +1693,6 @@ function Module.Build(ctx)
 		end,
 	}, "playerEspFill")
 
-	-- Everyone in the world except you. In this game the people who matter are
-	-- the ones walking toward your base, so nobody is filtered out by state the
-	-- way the arena filtered out the lobby.
-	core:StartESP({
-		flag = "playerEsp",
-		interval = 0.3,
-		list = function()
-			local out = {}
-			for _, player in ipairs(Players:GetPlayers()) do
-				if player ~= LocalPlayer and player.Character then
-					out[#out + 1] = player.Character
-				end
-			end
-			return out
-		end,
-		maxDistance = function()
-			return tonumber(F.eggEspRange) or 2500
-		end,
-		fill = function()
-			return tonumber(F.playerEspFill) or 0.25
-		end,
-		colour = function()
-			return Color3.fromRGB(235, 235, 235)
-		end,
-		label = function(model, distance)
-			return ("%s · %d"):format(model.Name, math.floor(distance))
-		end,
-	})
-
 	-------------------------------------------------------------- player · left
 
 	playerLeft:Header({ Text = "Session" })
@@ -1123,337 +1752,6 @@ function Module.Build(ctx)
 		end,
 	}, "hopPing")
 
-	----------------------------------------------------------------------------
-	-- moving server
-	----------------------------------------------------------------------------
-
-	-- Lifted whole from Ability Arena, deliberately unchanged. It is the same
-	-- job in both games and a second copy that drifted would be worse than a
-	-- shared one that did not.
-	-- `ping` on this listing is what the server reports for the people already
-	-- in it, not what ours would be. It is a good enough proxy - a server whose
-	-- players are all on 300 is a server on the other side of the world - but it
-	-- is not a promise, which is why the control is a ceiling rather than a
-	-- target.
-	local SERVER_LIST = "https://games.roblox.com/v1/games/%d/servers/Public?sortOrder=Desc&limit=100"
-	local hopping = false
-
-	local function bestServer()
-		local ok, body = pcall(function()
-			return game:HttpGet(SERVER_LIST:format(game.PlaceId))
-		end)
-		if not ok then
-			return nil, "Could not read the server list"
-		end
-
-		local read, decoded = pcall(function()
-			return HttpService:JSONDecode(body)
-		end)
-		if not read or type(decoded) ~= "table" then
-			return nil, "The server list came back unreadable"
-		end
-
-		local mode = F.hopPick or "Full and Fast"
-		local ceiling = tonumber(F.hopPing) or 250
-		local best, bestScore, tooSlow = nil, -math.huge, 0
-
-		for _, server in ipairs(decoded.data or {}) do
-			local seats = tonumber(server.maxPlayers) or 0
-			local playing = tonumber(server.playing) or 0
-			if playing < seats and server.id ~= game.JobId then
-				local ping = tonumber(server.ping) or 0
-				if ping > ceiling then
-					tooSlow += 1
-				else
-					local score
-					if mode == "Most Players" then
-						score = playing
-					elseif mode == "Lowest Ping" then
-						score = -ping
-					else
-						-- How full it is against how slow it is. Full counts for
-						-- a hundred, so a quarter of the ping puts a 60 ms
-						-- server four fifths full ahead of a 200 ms one that is
-						-- completely full.
-						score = (playing / math.max(seats, 1)) * 100 - ping / 4
-					end
-					if score > bestScore then
-						best, bestScore = server, score
-					end
-				end
-			end
-		end
-
-		if not best then
-			if tooSlow > 0 then
-				return nil, ("Every server with room was slower than %d ms"):format(ceiling)
-			end
-			return nil, "No other server had room"
-		end
-		return best
-	end
-
-	local function hopNow(why)
-		if hopping then
-			return
-		end
-		hopping = true
-		task.spawn(function()
-			local server, trouble = bestServer()
-			if not server then
-				core:Notify(Module.Name, trouble or "Nowhere to move to", 4)
-				hopping = false
-				return
-			end
-			core:Notify(
-				Module.Name,
-				("%s. Moving to a %d of %d server on %d ms"):format(
-					why or "Changing server",
-					tonumber(server.playing) or 0,
-					tonumber(server.maxPlayers) or 0,
-					math.floor(tonumber(server.ping) or 0)
-				),
-				5
-			)
-			-- Long enough for that to be readable before the screen goes.
-			task.wait(1.2)
-			-- Queue the hub to load itself again on the other side. A teleport
-			-- ends the script that started it, so without this the farm arrives
-			-- somewhere busier with nothing running.
-			if type(core.QueueRelaunch) == "function" then
-				core.QueueRelaunch()
-			end
-			local sent = pcall(function()
-				TeleportService:TeleportToPlaceInstance(game.PlaceId, server.id, Players.LocalPlayer)
-			end)
-			if not sent then
-				core:Notify(Module.Name, "The game refused the move", 4)
-			end
-			-- A teleport that is accepted takes several seconds to happen. This
-			-- stops the loop below firing another one into the gap.
-			task.wait(10)
-			hopping = false
-		end)
-	end
-
-
-	local quietSince = nil
-	local arrived = core.ArrivedAt or os.clock()
-
-	core:Loop("serverHop", 3, function()
-		if not F.autoHop or hopping then
-			quietSince = nil
-			return
-		end
-		-- Players replicate in over the first second or two of a join, so a
-		-- server you have only just arrived in always looks empty. Without this
-		-- the first hop starts a chain that never stops.
-		if os.clock() - arrived < 20 then
-			quietSince = nil
-			return
-		end
-		local here = #Players:GetPlayers()
-		if here >= (tonumber(F.hopBelow) or 4) then
-			quietSince = nil
-			return
-		end
-		quietSince = quietSince or os.clock()
-		if os.clock() - quietSince < 6 then
-			return
-		end
-		quietSince = nil
-		hopNow(("Only %d left here"):format(here))
-	end)
-
-	----------------------------------------------------------------------------
-	-- egg ESP
-	----------------------------------------------------------------------------
-
-	-- The hub's own ESP wants models with humanoids in them, which an egg in a
-	-- nest is not. This draws from the same ranked list the farm reads, so
-	-- whatever the label says is the best egg is the one the farm is about to
-	-- walk to. There is only one list and it cannot disagree with itself.
-	--
-	-- Colour is the rank, not the rarity. Rarity is already on the nest; what
-	-- the game does not show you is that this Pterodactyl is worth twenty times
-	-- the one behind you because of its size.
-	--
-	-- Every egg is a real model, `Workspace.AreaEggSlotsClient.<uid>`, so this
-	-- adorns to those rather than parking parts of its own in the world. The
-	-- first attempt did the latter and they silently never appeared: something
-	-- in this game sweeps instances it did not put in Workspace, and a folder
-	-- parented there is gone before the next frame without an error.
-	--
-	-- **The whole pool is built here and never grows.** A loop thread is
-	-- resumed by the engine after it waits, and a resumed thread cannot call
-	-- Instance.new at all - it fails with "the current thread cannot access
-	-- Instance" every tick, forever, and the ESP silently draws nothing. So the
-	-- billboards are made once, on the build thread, and the loop only ever
-	-- points them at things. It is also simply better: no allocation twice a
-	-- second and nothing for the collector to chase.
-	local EGG_MODELS = "AreaEggSlotsClient"
-	local ESP_POOL = 60
-
-	local espHolder = Instance.new("Folder")
-	espHolder.Name = "MeridianEggs"
-	espHolder.Parent = (gethui and gethui()) or game:GetService("CoreGui")
-	core:Track(espHolder)
-
-	local espPool = {}
-	for _ = 1, ESP_POOL do
-		local billboard = Instance.new("BillboardGui")
-		billboard.Size = UDim2.fromOffset(240, 34)
-		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
-		billboard.AlwaysOnTop = true
-		billboard.Enabled = false
-		billboard.Parent = espHolder
-
-		local label = Instance.new("TextLabel")
-		label.BackgroundTransparency = 1
-		label.Size = UDim2.fromScale(1, 1)
-		label.Font = Enum.Font.GothamMedium
-		label.TextSize = 15
-		label.TextStrokeTransparency = 0.4
-		label.Parent = billboard
-
-		local highlight = Instance.new("Highlight")
-		highlight.FillTransparency = 0.85
-		highlight.OutlineTransparency = 0.2
-		highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-		highlight.Enabled = false
-		highlight.Parent = espHolder
-
-		espPool[#espPool + 1] = { billboard = billboard, label = label, highlight = highlight }
-	end
-
-	local function espColour(worth, best)
-		if best <= 0 then
-			return Color3.fromRGB(235, 235, 235)
-		end
-		-- A root rather than a straight ratio, because one Cosmic egg on the map
-		-- makes every other worth a fraction of a percent of it, and a linear
-		-- ramp would paint everything else the same grey.
-		local part = math.clamp(worth / best, 0, 1) ^ 0.4
-		return Color3.fromRGB(150, 150, 150):Lerp(Color3.fromRGB(120, 255, 190), part)
-	end
-
-	local function hideFrom(index)
-		for slot = index, ESP_POOL do
-			local mark = espPool[slot]
-			if not mark.billboard.Enabled and not mark.highlight.Enabled then
-				break
-			end
-			mark.billboard.Enabled = false
-			mark.highlight.Enabled = false
-			mark.billboard.Adornee = nil
-			mark.highlight.Adornee = nil
-		end
-	end
-
-	core:Loop("eggEsp", 0.3, function()
-		if not F.eggEsp then
-			hideFrom(1)
-			return
-		end
-
-		local models = Workspace:FindFirstChild(EGG_MODELS)
-		if not models then
-			hideFrom(1)
-			return
-		end
-
-		local ranked = rankedEggs()
-		local range = tonumber(F.eggEspRange) or 2500
-		local floor = F.eggEspFilter ~= false and (tonumber(F.stealFloor) or 0) or 0
-		local best = ranked[1] and ranked[1].worth or 0
-
-		local slot = 0
-		for _, egg in ipairs(ranked) do
-			if slot >= ESP_POOL then
-				break
-			end
-			if egg.distance <= range and egg.worth >= floor then
-				local model = models:FindFirstChild(egg.record.Uid)
-				local anchor = model
-					and (model.PrimaryPart or model:FindFirstChild("Hitbox") or model:FindFirstChildWhichIsA("BasePart"))
-				if anchor then
-					slot = slot + 1
-					local mark = espPool[slot]
-
-					local text = eggName(egg.record)
-					if F.eggEspWorth ~= false then
-						text = text .. " · " .. short(egg.worth)
-					end
-					if #egg.mutations > 0 then
-						text = text .. " · " .. table.concat(egg.mutations, ", ")
-					end
-					if F.eggEspDistance then
-						text = text .. " · " .. math.floor(egg.distance)
-					end
-
-					local colour = espColour(egg.worth, best)
-					mark.label.Text = text
-					mark.label.TextColor3 = colour
-					mark.highlight.FillColor = colour
-					mark.highlight.OutlineColor = colour
-					mark.billboard.Adornee = anchor
-					mark.highlight.Adornee = model
-					mark.billboard.Enabled = true
-					mark.highlight.Enabled = true
-				end
-			end
-		end
-
-		hideFrom(slot + 1)
-	end)
-
-	----------------------------------------------------------------------------
-	-- anti afk
-	----------------------------------------------------------------------------
-
-	core:Connect(LocalPlayer.Idled, function()
-		if F.antiAfk == false then
-			return
-		end
-		local VirtualUser = game:GetService("VirtualUser")
-		VirtualUser:CaptureController()
-		VirtualUser:ClickButton2(Vector2.new())
-	end)
-
-	----------------------------------------------------------------------------
-	-- what the dashboard shows
-	----------------------------------------------------------------------------
-
-	-- The dashboard reads fixed keys off core.Stats, and core.Headline is the
-	-- one line it shows above them. A game module never touches the interface
-	-- itself, so this is the whole of what it publishes.
-	core:Loop("stats", 1, function()
-		local minutes = math.max((os.clock() - stats.started) / 60, 1 / 60)
-		local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
-		local perSecond = leaderstats and leaderstats:FindFirstChild("Money/s")
-
-		local carried = core.Stats or {}
-		carried.Hits = stats.taken
-		carried.Rate = math.floor(stats.taken / minutes * 60)
-		carried.Total = stats.placed
-		carried.Holding = perSecond and (short(perSecond.Value) .. " a second") or "nothing yet"
-		core.Stats = carried
-
-		local held = carriedUid()
-		if held then
-			core.Headline = "Carrying one home"
-		elseif currentTarget then
-			core.Headline = ("%s · %s a second · %d studs away"):format(
-				eggName(currentTarget.record),
-				short(currentTarget.worth),
-				math.floor(currentTarget.distance)
-			)
-		elseif F.autoSteal then
-			core.Headline = "Looking for something worth the walk"
-		else
-			core.Headline = nil
-		end
-	end)
 
 	-- Off the build thread, deliberately, and this is not a style choice.
 	--

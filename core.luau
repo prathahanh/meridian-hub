@@ -41,12 +41,28 @@ end
 
 -- A named loop. Starting one that already exists replaces it, so a toggle
 -- flipped twice never leaves two copies running.
+-- Every loop puts its own identity back before it runs.
+--
+-- A thread inherits the capability set of whatever created it, and a loop
+-- created part way through the hub being built inherits a set that cannot touch
+-- an Instance at all: no ESP draws, no label updates, and every tick warns
+-- "the current thread cannot access Instance" forever. It is not visible until
+-- something in the module yields at the wrong moment, which makes it a trap
+-- rather than a bug, so this pays one cheap call per tick to close it.
+local function reclaim()
+	if setthreadidentity then
+		pcall(setthreadidentity, 8)
+	end
+end
+
 function Core:Loop(name, interval, fn)
 	self:StopLoop(name)
 	local record = { alive = true }
 	self._loops[name] = record
 	record.thread = task.spawn(function()
+		reclaim()
 		while record.alive and self.Alive do
+			reclaim()
 			-- xpcall rather than pcall, so a loop that breaks says where. A bare
 			-- message with no line in it cost a long time once already.
 			local ok, err = xpcall(fn, function(problem)
