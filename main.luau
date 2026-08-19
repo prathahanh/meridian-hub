@@ -273,13 +273,6 @@ core.QueueRelaunch = function()
 	if type(queue) ~= "function" then
 		return false
 	end
-	-- Queueing appends, and this is called again every time the switches change,
-	-- so without clearing first an overnight session arrives in the new server
-	-- and loads the hub a hundred times over the top of itself.
-	local clear = clear_teleport_queue or clearqueueonteleport or cleartpqueue or clearteleportqueue
-	if type(clear) == "function" then
-		pcall(clear)
-	end
 	local carry = ""
 	if type(core.Key) == "string" and core.Key ~= "" then
 		carry = ("getgenv().%sKey = %q "):format(SHORT, core.Key)
@@ -290,7 +283,26 @@ core.QueueRelaunch = function()
 	if packed and type(blob) == "string" then
 		carry = carry .. ("getgenv().%sCarry = %q "):format(SHORT, blob)
 	end
-	local ok = pcall(queue, carry .. relaunchSource())
+	local source = carry .. relaunchSource()
+	-- Nothing to do if the queue already holds exactly this, and doing nothing
+	-- matters: clearing and re-queueing on a timer means there is always a
+	-- moment when the queue is empty, and a teleport landing in one of those
+	-- moments is a farm that spends the rest of the night in a new server doing
+	-- nothing. In the steady state this now touches the queue zero times.
+	if core.LastRelaunch == source then
+		return true
+	end
+	local clear = clear_teleport_queue or clearqueueonteleport or cleartpqueue or clearteleportqueue
+	if type(clear) == "function" then
+		pcall(clear)
+	end
+	local ok, why = pcall(queue, source)
+	core.LastRelaunchError = not ok and tostring(why) or nil
+	if ok then
+		-- Kept so a session that comes back without its switches can be asked
+		-- what it queued, rather than guessed at.
+		core.LastRelaunch = source
+	end
 	return ok
 end
 
@@ -551,6 +563,29 @@ local UI = import("ui.luau")
 local Dashboard = import("dashboard.luau")
 local GameModule = import(entry.path)
 
+-- Arming the relaunch belongs to loading the hub, not to one of the two ways of
+-- getting in, and putting it in the wrong one of those is what made "leave it
+-- running overnight" untrue.
+--
+-- A key typed at the door goes through Access.Ask and onUnlocked. A key that
+-- arrived in the teleport queue skips all of that and returns early, twenty
+-- lines below. The arming lived in the first branch only, so the hub armed a
+-- relaunch exactly once - when a person typed a key - and every teleport after
+-- that landed in a new server with the hub dead and nothing left to bring it
+-- back. Both branches call this now.
+local function armRelaunch()
+	if type(core.QueueRelaunch) ~= "function" then
+		return
+	end
+	core.QueueRelaunch()
+	-- Checked often, written rarely. Rebuilding the string is a table walk and a
+	-- JSON encode; the queue itself is only touched when a switch has actually
+	-- moved since last time, so there is never a moment where it sits empty.
+	core:Loop("relaunch", 5, function()
+		core.QueueRelaunch()
+	end)
+end
+
 local carried = getgenv()[SHORT .. "Key"]
 getgenv()[SHORT .. "Key"] = nil
 if type(carried) == "string" and verifyKey(carried) then
@@ -562,6 +597,7 @@ if type(carried) == "string" and verifyKey(carried) then
 		restored = applyCarried(blob)
 	end
 	core.ArrivedAt = os.clock()
+	armRelaunch()
 	core:Notify(
 		BRAND,
 		restored > 0 and ("New server, %d settings carried over"):format(restored) or "New server",
@@ -614,22 +650,10 @@ Access.Ask({
 			end
 
 			-- Keep a relaunch queued for whatever teleport comes next, not just
-			-- the ones the hub starts.
-			--
-			-- Steal An Egg moves you on its own: the area egg reset teleports
-			-- everybody, and a server rotates underneath an unattended farm
-			-- several times a night. The hop button used to be the only thing
-			-- that queued anything, so every teleport the hub did not start left
-			-- the account in a fresh server with nothing running, which is the
-			-- difference between a script you can leave on overnight and one you
-			-- have to sit next to. Refreshed on a timer so the switches that
-			-- travel are the ones that are on now.
-			if type(core.QueueRelaunch) == "function" then
-				core.QueueRelaunch()
-				core:Loop("relaunch", 45, function()
-					core.QueueRelaunch()
-				end)
-			end
+			-- the ones the hub starts. Steal An Egg moves you on its own: the
+			-- area egg reset teleports everybody, and a server rotates underneath
+			-- an unattended farm several times a night.
+			armRelaunch()
 
 			ceremony:Finish(function()
 				Access.Reveal(core, base)
