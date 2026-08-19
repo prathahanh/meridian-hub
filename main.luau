@@ -24,9 +24,16 @@ local DISCORD = "https://discord.gg/prism"
 -- Worked out rather than set, so this file is the same file in both places. A
 -- mode that has to be flipped by hand means the copy in the repo is the working
 -- copy with one line changed, and that line is the one that gets forgotten.
+-- The branch testers load from. Every branch's copy of this file names the same
+-- one on purpose: promoting a build is then a fast-forward with nothing to edit,
+-- and there is no line to forget. The cost is that a link pointing at any other
+-- branch would fetch that branch's main.luau and everything else from this one,
+-- so there is only ever one link to hand out and this is the branch it names.
+local CHANNEL = "stable"
+
 local SOURCE = {
 	folder = "Meridian/",
-	base = "https://raw.githubusercontent.com/prathahanh/meridian-hub/stable/",
+	base = ("https://raw.githubusercontent.com/prathahanh/meridian-hub/%s/"):format(CHANNEL),
 }
 
 SOURCE.mode = (function()
