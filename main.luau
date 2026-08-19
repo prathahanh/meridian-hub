@@ -79,6 +79,25 @@ for _, key in ipairs({ "Meridian", "Prism" }) do
 	genv[key] = nil
 end
 
+-- Unloading whatever finished before us is not enough, and he has seen why:
+-- two hubs on screen at once, every click landing on whichever happened to be
+-- in front.
+--
+-- The sweep above only catches a run that had already published a handle. Two
+-- runs starting within a second of each other - a relaunch queued for a
+-- teleport and a loader run by hand, which is exactly what a session of testing
+-- looks like - both find nothing to unload and both finish.
+--
+-- So each run takes a number, and the newest number wins. A run that finds a
+-- newer one has appeared while it was loading stops where it is rather than
+-- putting a second window up.
+local RUN = (tonumber(genv.MeridianRun) or 0) + 1
+genv.MeridianRun = RUN
+
+local function stale()
+	return genv.MeridianRun ~= RUN
+end
+
 -- That alone is not enough. Rejoining the game throws away the environment
 -- that remembered the old window while the hidden gui container survives, so
 -- the next run would build a second menu on top of an orphaned one, and every
@@ -522,6 +541,13 @@ local function start(Chrome, UI, Dashboard, module, hidden)
 	local tabs = built and built.Tabs or {}
 	tabs.Settings = settings
 
+	-- Somebody newer started while this one was building. Take this window back
+	-- down rather than leaving two of them up.
+	if stale() then
+		pcall(unload)
+		return nil, nil
+	end
+
 	genv.Meridian = {
 		Core = core,
 		Window = Window,
@@ -589,7 +615,10 @@ end
 local carried = getgenv()[SHORT .. "Key"]
 getgenv()[SHORT .. "Key"] = nil
 if type(carried) == "string" and verifyKey(carried) then
-	start(Chrome, UI, Dashboard, GameModule, false)
+	local window = start(Chrome, UI, Dashboard, GameModule, false)
+	if not window or stale() then
+		return
+	end
 	local blob = getgenv()[SHORT .. "Carry"]
 	getgenv()[SHORT .. "Carry"] = nil
 	local restored = 0
@@ -646,6 +675,12 @@ Access.Ask({
 				ceremony:Finish(function()
 					core:Notify(BRAND, entry.name .. " did not load. " .. why, 12)
 				end)
+				return
+			end
+
+			-- A newer run took over while this one was building, and it has
+			-- already taken this window back down. Say nothing and stop.
+			if not base or stale() then
 				return
 			end
 

@@ -55,7 +55,8 @@ Module.Tips = {
 	["Treadmill For The Next Area"] = "When the next area is one sitting away on the treadmill, goes and stands on it until you can get in, then goes back to farming.",
 	["Auto Rebirth"] = "Rebirths as soon as the game lets you.",
 	["Rebirth Now"] = "Rebirths, right now.",
-	["Claim Index"] = "Collects every index reward you have earned.",
+	["Claim Index"] = "Collects every index reward you have earned, including the limited egg one.",
+	["Claim Group Reward"] = "Takes the reward for being in the group, if you are in it.",
 	["Auto Free Gifts"] = "Takes the free gifts as they come up.",
 	["Auto Lucky Blocks"] = "Opens lucky blocks as they are stored.",
 	["Redeem Codes"] = "Tries every code the game currently has active.",
@@ -461,6 +462,16 @@ function Module.Build(ctx)
 		local ceiling = BACKOFF_MAX[key] or BACKOFF_CAP
 		nextDue[key] = os.clock() + math.min(interval * (2 ^ count), ceiling)
 		return count
+	end
+
+	-- A purchase sent on a RemoteEvent gets no answer, so there is no refusal to
+	-- count and nothing to back off from. Base upgrades were fired every twenty
+	-- seconds forever on that basis. Record what was in the bank instead: it
+	-- will not be asked again until there is more than there was, which covers
+	-- both "could not afford it" and "bought it, and the next one costs more".
+	local function spent(key, interval)
+		refusedAt[key] = money()
+		nextDue[key] = os.clock() + interval
 	end
 
 	local function accepted(key)
@@ -1077,6 +1088,57 @@ function Module.Build(ctx)
 	-- call they make, same frame, ours last.
 	local steer = { direction = nil }
 
+	local function treadmillSpot()
+		local data = plotData()
+		local folder = data and data.PlotFolder
+		local bottom = folder and folder:FindFirstChild("TreadmillBottom", true)
+		return bottom and bottom:IsA("BasePart") and bottom.Position or nil
+	end
+
+	-- Standing still on purpose is not being stuck, and the treadmill is the one
+	-- place where the two look identical.
+	local grinding = false
+
+	-- Walk around the treadmill rather than over it.
+	--
+	-- The way out of the base runs straight across it and stepping on one
+	-- anchors the character, so the farm stopped dead, got itself off a second
+	-- later, took two steps and stood on it again. He noticed it every single
+	-- time he came back. Getting off it quickly was treating the symptom.
+	--
+	-- This is the ordinary steering answer: while we are not deliberately
+	-- riding it, anything in front of us and near the line gets pushed around
+	-- rather than walked through, harder the closer it is to dead ahead.
+	local TREADMILL_CLEAR = 20
+
+	local function dodgeTreadmill(from, direction)
+		if grinding then
+			return direction
+		end
+		local spot = treadmillSpot()
+		if not spot then
+			return direction
+		end
+		local toward = Vector3.new(spot.X - from.X, 0, spot.Z - from.Z)
+		local range = toward.Magnitude
+		if range < 0.1 or range > TREADMILL_CLEAR * 3 then
+			return direction
+		end
+		if toward.Unit:Dot(direction) <= 0.2 then
+			-- Behind us or off to the side. Nothing to walk into.
+			return direction
+		end
+		local side = toward - direction * toward:Dot(direction)
+		local off = side.Magnitude
+		if off > TREADMILL_CLEAR then
+			return direction
+		end
+		local push = off < 0.1 and Vector3.new(-direction.Z, 0, direction.X) or -side.Unit
+		local strength = math.clamp((TREADMILL_CLEAR - off) / TREADMILL_CLEAR, 0, 1) * 1.7
+		local out = direction + push * strength
+		return out.Magnitude > 0.01 and out.Unit or direction
+	end
+
 	function stopWalking()
 		steer.direction = nil
 		local hum = core:Humanoid()
@@ -1137,7 +1199,7 @@ function Module.Build(ctx)
 			steer.direction = nil
 			return false
 		end
-		steer.direction = flat.Unit
+		steer.direction = dodgeTreadmill(root.Position, flat.Unit)
 		return false
 	end
 
@@ -1162,11 +1224,34 @@ function Module.Build(ctx)
 	-- you are on, or with nothing when you get off. Ask the game, not the map.
 	local treadmill = { active = nil }
 
+	-- The screen on the treadmill plays video the whole time you are on it, which
+	-- costs frames and is the last thing anyone leaving a farm running overnight
+	-- wants playing. The game has a Stop of its own, so getting on it stops the
+	-- video once and leaves it alone after that.
+	local VideoController = nil
+	do
+		local ok, module = pcall(function()
+			return require(Client:WaitForChild("TreadmillVideoController", 5))
+		end)
+		VideoController = ok and type(module) == "table" and module or nil
+	end
+
+	local function hushTheScreen()
+		if not VideoController or type(VideoController.Stop) ~= "function" then
+			return
+		end
+		pcall(VideoController.Stop)
+	end
+
 	do
 		local ok, signal = pcall(Network.Fired, NET.Treadmills.ACTIVE_TREADMILL_EVENT)
 		if ok and type(signal) == "table" and signal.Connect then
 			core:Connect(signal, function(which)
-				treadmill.active = which ~= nil
+				local on = which ~= nil
+				if on and not treadmill.active then
+					hushTheScreen()
+				end
+				treadmill.active = on
 			end)
 		end
 	end
@@ -1268,13 +1353,6 @@ function Module.Build(ctx)
 		return gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE, area, gap
 	end
 
-	local function treadmillSpot()
-		local data = plotData()
-		local folder = data and data.PlotFolder
-		local bottom = folder and folder:FindFirstChild("TreadmillBottom", true)
-		return bottom and bottom:IsA("BasePart") and bottom.Position or nil
-	end
-
 	-- Getting off, which matters more than it sounds: a treadmill anchors the
 	-- root part, so a farm that steps on one on the way out of its own base and
 	-- cannot get off again is a farm that has finished for the night. The path
@@ -1369,10 +1447,6 @@ function Module.Build(ctx)
 	-- covered any ground, something is holding it: the treadmill, almost always.
 	local stuckFrom, stuckAt = nil, nil
 
-	-- Standing still on purpose is not being stuck, and the treadmill is the one
-	-- place where the two look identical.
-	local grinding = false
-
 	local function watchForStuck()
 		if grinding then
 			stuckFrom = nil
@@ -1399,8 +1473,14 @@ function Module.Build(ctx)
 				-- And jump, because a good half of these are a lip an inch high
 				-- that the humanoid will not walk up and will hop over without
 				-- being asked twice.
+				--
+				-- Not while anchored, though. A treadmill anchors the root part,
+				-- and a character jumping on the spot while the server has it
+				-- pinned is not something a player can do, which is exactly the
+				-- sort of thing a character integrity check is watching for.
+				local feet = core:Root()
 				local hum = core:Humanoid()
-				if hum then
+				if hum and feet and not feet.Anchored then
 					pcall(function()
 						hum:ChangeState(Enum.HumanoidStateType.Jumping)
 					end)
@@ -1409,7 +1489,105 @@ function Module.Build(ctx)
 		end
 	end
 
+	-- The server watches the character and says so when it disagrees.
+	--
+	-- ClientCharacter carries IntegrityViolation, CorrectionStarted and an
+	-- IntegrityHeartbeat, which means this game keeps its own model of where you
+	-- should be and how fast you got there. Nothing in the client calls those,
+	-- so they are the server talking to us, and they are the closest thing to a
+	-- warning shot before a kick.
+	--
+	-- So when one arrives: stop moving, stand still for a few seconds, and say
+	-- so on screen. A farm that freezes for five seconds has lost five seconds.
+	-- A farm that carries on has lost the account for the evening.
+	local flagged = { until_ = 0, count = 0 }
+
+	local function warned(what)
+		flagged.until_ = os.clock() + 6
+		flagged.count = flagged.count + 1
+		stopWalking()
+		clearRoute()
+		warn(("[Meridian] the server flagged the character (%s), standing still for a moment"):format(what))
+		if flagged.count <= 3 or flagged.count % 10 == 0 then
+			core:Notify("Meridian", ("Server said %s. Waiting a moment."):format(what), 5)
+		end
+	end
+
+	for name, label in pairs({
+		INTEGRITY_VIOLATION = "the character moved wrong",
+		CORRECTION_STARTED = "it is correcting the character",
+	}) do
+		local action = NET.ClientCharacter and NET.ClientCharacter[name]
+		if action then
+			local ok, signal = pcall(Network.Fired, action)
+			if ok and type(signal) == "table" and signal.Connect then
+				core:Connect(signal, function()
+					warned(label)
+				end)
+			end
+		end
+	end
+
+	-- Write down what the game says when it kicks us, because it says why and
+	-- nobody is ever watching at the moment it happens.
+	--
+	-- The kick message lands in Roblox's own error prompt, which survives just
+	-- long enough to read and then the client rejoins and the console is gone
+	-- with it. So it goes to a file, with what the farm was doing at the time.
+	-- After a night of this the file answers a question we have been guessing
+	-- at: whether it is the requests or the character.
+	local KICK_LOG = "Meridian/kicks.txt"
+
+	local function noteKick(reason)
+		local newline = string.char(10)
+		local line = ("%s | %s | doing: %s | flagged %d times this session"):format(
+			os.date("%Y-%m-%d %H:%M:%S"),
+			tostring(reason):gsub("%s+", " "),
+			tostring(core.Headline or "nothing"),
+			flagged.count
+		) .. newline
+		warn("[Meridian] kicked: " .. line)
+		pcall(function()
+			local existing = ""
+			if isfile and isfile(KICK_LOG) then
+				existing = readfile(KICK_LOG)
+			end
+			writefile(KICK_LOG, existing .. line)
+		end)
+	end
+
+	do
+		local ok, coreGui = pcall(function()
+			return game:GetService("CoreGui")
+		end)
+		if ok and coreGui then
+			core:Connect(coreGui.DescendantAdded, function(thing)
+				if not thing:IsA("TextLabel") then
+					return
+				end
+				local prompt = thing:FindFirstAncestor("ErrorPrompt")
+					or thing:FindFirstAncestor("ErrorTitleFrame")
+					or thing:FindFirstAncestor("promptOverlay")
+				if not prompt then
+					return
+				end
+				task.delay(0.35, function()
+					local text = thing.Text
+					if type(text) == "string" and #text > 8 then
+						noteKick(text)
+					end
+				end)
+			end)
+		end
+	end
+
 	core:Loop("steal", 0.1, function()
+		if os.clock() < flagged.until_ then
+			-- Being told off is the one time standing still is the right answer.
+			stopWalking()
+			return
+		end
+
 		if not F.autoSteal then
 			if currentTarget then
 				dropTarget()
@@ -1701,8 +1879,9 @@ function Module.Build(ctx)
 			end
 		end
 
-		if F.baseUpgrade and due("upgrade", 20) then
+		if F.baseUpgrade and due("upgrade", 120) then
 			ask(NET.Plots.REQUEST_BASE_UPGRADE)
+			spent("upgrade", 120)
 		end
 	end)
 
@@ -1755,20 +1934,44 @@ function Module.Build(ctx)
 	-- progress
 	----------------------------------------------------------------------------
 
+	-- Everything the game will hand over for nothing, asked for on a gate.
+	--
+	-- These used to fire every minute whether or not there was anything to
+	-- collect, which over a night is several hundred refusals for each - the
+	-- shape that gets an account kicked, delivered slowly. A refusal now counts
+	-- as one, so the backoff doubles and the breaker parks it, and the moment
+	-- something is actually claimable it goes back to working.
+	--
+	-- Four of the names in the network map have no remote behind them in this
+	-- game: free gifts, lucky blocks, rebirth and codes. ask() looks the remote
+	-- up before calling and returns quietly, so the switches can stay on screen
+	-- without costing anything.
+	local FREE = {
+		{ flag = "progIndex", key = "index", every = 120, action = NET.Index.REQUEST_CLAIM_ALL },
+		{ flag = "progIndex", key = "indexEgg", every = 180, action = NET.Index.REQUEST_CLAIM_LIMITED_EGG_REWARD },
+		{ flag = "progGroup", key = "group", every = 300, action = NET.GroupReward.CLAIM_REWARD },
+		{ flag = "progGifts", key = "gifts", every = 120, action = NET.FreeGifts.REQUEST_CLAIM },
+		{ flag = "progLucky", key = "lucky", every = 90, action = NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM },
+	}
+
 	core:Loop("progress", 8, function()
-		if F.progIndex and due("index", 60) then
-			ask(NET.Index.REQUEST_CLAIM_ALL)
+		for _, claim in ipairs(FREE) do
+			if F[claim.flag] ~= false and due(claim.key, claim.every) then
+				if ask(claim.action) then
+					accepted(claim.key)
+				else
+					refused(claim.key, claim.every)
+				end
+			end
 		end
-		if F.progGifts and due("gifts", 60) then
-			ask(NET.FreeGifts.REQUEST_CLAIM)
-		end
-		if F.progLucky and due("lucky", 45) then
-			ask(NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM)
-		end
-		if F.progRebirth and due("rebirth", 60) then
-			ask(NET.Rebirth.REQUEST_REBIRTH)
-			task.wait(0.5)
-			ask(NET.Rebirth.REQUEST_REBIRTH_COMMIT)
+		if F.progRebirth and due("rebirth", 120) then
+			if ask(NET.Rebirth.REQUEST_REBIRTH) then
+				task.wait(0.5)
+				ask(NET.Rebirth.REQUEST_REBIRTH_COMMIT)
+				accepted("rebirth")
+			else
+				refused("rebirth", 120)
+			end
 		end
 	end)
 
@@ -2380,7 +2583,7 @@ function Module.Build(ctx)
 
 	baseRight:Toggle({
 		Name = "Claim Offline Money",
-		Default = false,
+		Default = true,
 		Callback = function(state)
 			F.baseOffline = state
 		end,
@@ -2488,7 +2691,7 @@ function Module.Build(ctx)
 
 	progRight:Toggle({
 		Name = "Claim Index",
-		Default = false,
+		Default = true,
 		Callback = function(state)
 			F.progIndex = state
 		end,
@@ -2496,15 +2699,23 @@ function Module.Build(ctx)
 
 	progRight:Toggle({
 		Name = "Auto Free Gifts",
-		Default = false,
+		Default = true,
 		Callback = function(state)
 			F.progGifts = state
 		end,
 	}, "progGifts")
 
 	progRight:Toggle({
+		Name = "Claim Group Reward",
+		Default = true,
+		Callback = function(state)
+			F.progGroup = state
+		end,
+	}, "progGroup")
+
+	progRight:Toggle({
 		Name = "Auto Lucky Blocks",
-		Default = false,
+		Default = true,
 		Callback = function(state)
 			F.progLucky = state
 		end,
