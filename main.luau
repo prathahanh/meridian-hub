@@ -48,6 +48,7 @@ end)()
 
 local GAMES = {
 	{ id = 10230942274, path = "games/ability_arena.luau", name = "Ability Arena" },
+	{ id = 10563114921, path = "games/steal_an_egg.luau", name = "Steal An Egg" },
 }
 
 --------------------------------------------------------------------------------
@@ -154,7 +155,7 @@ if not entry then
 	section:Header({ Text = "Nothing for this game yet" })
 	section:Paragraph({
 		Header = "Supported right now",
-		Body = "Ability Arena.\n\nSend the id below and it can be next.",
+		Body = "Ability Arena and Steal An Egg.\n\nSend the id below and it can be next.",
 	})
 	section:Button({
 		Name = "Copy Game ID",
@@ -586,7 +587,24 @@ Access.Ask({
 			ceremony:Step(0.6, entry.name:lower())
 
 			ceremony:Step(0.92, "window")
-			local _, base = start(Chrome, UI, Dashboard, GameModule, true)
+
+			-- Anything the game module throws used to end here, silently, with the
+			-- bar frozen at ninety-two percent and nothing to say whether it was
+			-- still working. A key that has been accepted has to reach an interface
+			-- or an explanation, never a bar that never moves again.
+			local ok, base = pcall(function()
+				local _, built = start(Chrome, UI, Dashboard, GameModule, true)
+				return built
+			end)
+
+			if not ok then
+				local why = tostring(base):gsub("^.-:%d+:%s*", "")
+				warn(("[%s] %s failed to build: %s"):format(BRAND, entry.name, tostring(base)))
+				ceremony:Finish(function()
+					core:Notify(BRAND, entry.name .. " did not load. " .. why, 12)
+				end)
+				return
+			end
 
 			ceremony:Finish(function()
 				Access.Reveal(core, base)
