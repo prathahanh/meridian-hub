@@ -385,6 +385,56 @@ function Module.Build(ctx)
 		nextDue[key] = nil
 	end
 
+	-- One way to reach the server, and it looks up what it is talking to first.
+	--
+	-- Network.Fire calls FireServer and Network.Invoke calls InvokeServer, and
+	-- which one is right is a property of the remote, not of what you are trying
+	-- to do. Treadmills: RequestUnequip is a RemoteFunction; firing it threw
+	-- "FireServer is not a valid member of RemoteFunction" on every attempt, and
+	-- a client throwing that at the server several times a second is what got
+	-- this account kicked three times.
+	--
+	-- Worse, four of the names in NETWORK_MAP have no remote in the folder at
+	-- all. Reaching for one of those is the documented way to poison this game's
+	-- network layer: it creates a BindableEvent under the Network folder, the
+	-- name caches in the wrong slot, and every later Invoke on any name comes
+	-- back as an Instance instead of the server's reply, until the client
+	-- rejoins.
+	--
+	-- So nothing is called by name alone. Find the remote, use the method it
+	-- actually is, and if it is not there, do nothing and say so.
+	local NetworkFolder = ReplicatedStorage:FindFirstChild("Network")
+
+	local function ask(action, ...)
+		if type(action) ~= "string" then
+			return false, "no such action"
+		end
+		local folder = NetworkFolder
+		if not folder or not folder.Parent then
+			folder = ReplicatedStorage:FindFirstChild("Network")
+			NetworkFolder = folder
+		end
+		local remote = folder and folder:FindFirstChild(action)
+		if not remote then
+			return false, "this game has no " .. action
+		end
+		if remote:IsA("RemoteFunction") then
+			local ok, reply, reason = pcall(Network.Invoke, action, ...)
+			if not ok then
+				return false, tostring(reply)
+			end
+			return reply ~= false, reason
+		end
+		if remote:IsA("RemoteEvent") then
+			local ok, err = pcall(Network.Fire, action, ...)
+			if ok then
+				return true
+			end
+			return false, tostring(err)
+		end
+		return false, action .. " is a " .. remote.ClassName
+	end
+
 	----------------------------------------------------------------------------
 	-- the snapshot
 	----------------------------------------------------------------------------
@@ -720,7 +770,7 @@ function Module.Build(ctx)
 			return
 		end
 		if due("treadmillOff", 4) then
-			pcall(Network.Fire, NET.Treadmills.REQUEST_UNEQUIP)
+			ask(NET.Treadmills.REQUEST_UNEQUIP)
 		end
 	end
 
@@ -984,13 +1034,13 @@ function Module.Build(ctx)
 		end
 
 		if F.baseUpgrade and due("upgrade", 20) then
-			pcall(Network.Invoke, NET.Plots.REQUEST_BASE_UPGRADE)
+			ask(NET.Plots.REQUEST_BASE_UPGRADE)
 		end
 	end)
 
 	core:Loop("offline", 10, function()
 		if F.baseOffline and due("offline", 90) then
-			pcall(Network.Invoke, NET.OfflineAssets.REQUEST_REDEEM)
+			ask(NET.OfflineAssets.REQUEST_REDEEM)
 		end
 	end)
 
@@ -999,7 +1049,7 @@ function Module.Build(ctx)
 	----------------------------------------------------------------------------
 
 	local function equipBest()
-		return pcall(Network.Invoke, NET.Backpack.EQUIP_BEST)
+		return ask(NET.Backpack.EQUIP_BEST)
 	end
 
 	core:Loop("pets", 6, function()
@@ -1019,7 +1069,7 @@ function Module.Build(ctx)
 	-- around 98, six times the default, entirely legitimately.
 	core:Loop("speed", 5, function()
 		if F.speedUpgrade and due("treadmill", 20) then
-			pcall(Network.Invoke, NET.Treadmills.REQUEST_UPGRADE)
+			ask(NET.Treadmills.REQUEST_UPGRADE)
 		end
 	end)
 
@@ -1029,18 +1079,18 @@ function Module.Build(ctx)
 
 	core:Loop("progress", 8, function()
 		if F.progIndex and due("index", 60) then
-			pcall(Network.Invoke, NET.Index.REQUEST_CLAIM_ALL)
+			ask(NET.Index.REQUEST_CLAIM_ALL)
 		end
 		if F.progGifts and due("gifts", 60) then
-			pcall(Network.Invoke, NET.FreeGifts.REQUEST_CLAIM)
+			ask(NET.FreeGifts.REQUEST_CLAIM)
 		end
 		if F.progLucky and due("lucky", 45) then
-			pcall(Network.Invoke, NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM)
+			ask(NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM)
 		end
 		if F.progRebirth and due("rebirth", 60) then
-			pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH)
+			ask(NET.Rebirth.REQUEST_REBIRTH)
 			task.wait(0.5)
-			pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH_COMMIT)
+			ask(NET.Rebirth.REQUEST_REBIRTH_COMMIT)
 		end
 	end)
 
@@ -1680,7 +1730,7 @@ function Module.Build(ctx)
 			-- round trip, and a callback that yields blocks the interface thread that
 			-- called it.
 			task.spawn(function()
-				pcall(Network.Invoke, NET.Backpack.SET_AUTO_SELL_STATE, state)
+				ask(NET.Backpack.SET_AUTO_SELL_STATE, state)
 			end)
 		end,
 	}, "petsAutoSell")
@@ -1689,7 +1739,7 @@ function Module.Build(ctx)
 		Name = "Sell Everything",
 		Callback = function()
 			task.spawn(function()
-				pcall(Network.Invoke, NET.AssetInventory.SELL_ALL_ASSETS)
+				ask(NET.AssetInventory.SELL_ALL_ASSETS)
 			end)
 		end,
 	})
@@ -1722,8 +1772,8 @@ function Module.Build(ctx)
 		Name = "Rebirth Now",
 		Callback = function()
 			task.spawn(function()
-				pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH)
-				pcall(Network.Invoke, NET.Rebirth.REQUEST_REBIRTH_COMMIT)
+				ask(NET.Rebirth.REQUEST_REBIRTH)
+				ask(NET.Rebirth.REQUEST_REBIRTH_COMMIT)
 			end)
 		end,
 	})
