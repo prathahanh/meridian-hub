@@ -31,7 +31,7 @@ local Module = {
 Module.Tips = {
 	["Auto Steal"] = "Walks to an egg, takes it, brings it home and puts it down. Then goes again.",
 	["Pick By"] = "What makes an egg worth the walk.",
-	["Stay Where You Win"] = "Only goes to areas your Speed is up to, using the recommended number on the sign at the mouth of each one.",
+	["Stay Where You Win"] = "Settles on the best area your Speed is up to and farms there, using the recommended number on the sign at the mouth of each one. Leaves it only for an egg worth several times more.",
 	["Areas"] = "Which parts of the map it is allowed to go to. Leave them all on and it goes wherever the best egg is.",
 	["Worth At Least"] = "Ignores anything earning less than this. The number is money a second, the same one the game shows on a pet.",
 	["Only Mutated"] = "Skips every ordinary egg, however big.",
@@ -41,6 +41,7 @@ Module.Tips = {
 	["Give Up After"] = "How long to spend on one egg before writing it off and picking another.",
 	["Auto Place"] = "Puts a carried egg down on your base as soon as you get there.",
 	["Auto Hatch"] = "Hatches every egg on your base the moment it is ready.",
+	["Equip Best After Hatching"] = "A new pet is the only thing that changes which pets should be out, so it checks then. Full pen means the worst one goes.",
 	["Auto Skip Growth"] = "Pays to skip the wait on eggs that are still growing. This spends money.",
 	["Claim Offline Money"] = "Collects what your pets earned while you were away.",
 	["Auto Collect"] = "Keeps collecting the money piling up on your base.",
@@ -51,6 +52,7 @@ Module.Tips = {
 	["Sell Everything"] = "Sells your whole inventory except favourites. There is no undo.",
 	["Auto Treadmill"] = "Stands on the treadmill and keeps earning Speed while you are not doing anything else.",
 	["Auto Upgrade Treadmill"] = "Buys the next treadmill whenever you can afford it.",
+	["Treadmill For The Next Area"] = "When the next area is one sitting away on the treadmill, goes and stands on it until you can get in, then goes back to farming.",
 	["Auto Rebirth"] = "Rebirths as soon as the game lets you.",
 	["Rebirth Now"] = "Rebirths, right now.",
 	["Claim Index"] = "Collects every index reward you have earned.",
@@ -561,6 +563,9 @@ function Module.Build(ctx)
 	-- leaving him to work it out from where the character is standing.
 	local chosenArea = nil
 
+	-- How much better a lower area has to be before the farm moves to it.
+	local ESCAPE_MULTIPLE = 3
+
 	local function rankedEggs()
 		local me = myPosition()
 		if not me then
@@ -622,12 +627,40 @@ function Module.Build(ctx)
 				table.move(bucket, 1, #bucket, #out + 1, out)
 			end
 		else
-			for _, area in ipairs(areasByTier()) do
+			local tiers = areasByTier()
+			local home, homeBest = nil, 0
+			for _, area in ipairs(tiers) do
 				local bucket = byArea[area.id]
 				if bucket and #bucket > 0 then
-					out = bucket
+					home = bucket
 					chosenArea = area.id
+					for _, egg in ipairs(bucket) do
+						if egg.worth > homeBest then
+							homeBest = egg.worth
+						end
+					end
 					break
+				end
+			end
+			out = home or {}
+
+			-- The top area is home, and it stays home even on a thin minute.
+			-- But when it has been picked clean and something several times
+			-- better is sitting in an area below, the walk is the same walk and
+			-- the trade goes the other way. Several times, not slightly: one
+			-- lucky Snow egg beating one Volcano egg is not a reason to move
+			-- house, which is the thing he caught it doing.
+			if home then
+				for _, area in ipairs(tiers) do
+					if area.id ~= chosenArea then
+						for _, egg in ipairs(byArea[area.id] or {}) do
+							if egg.worth > homeBest * ESCAPE_MULTIPLE then
+								out = byArea[area.id]
+								chosenArea = area.id
+								homeBest = egg.worth
+							end
+						end
+					end
 				end
 			end
 		end
@@ -834,10 +867,10 @@ function Module.Build(ctx)
 	-- fifty studs along instead, which follows the same route at a run.
 	local PathfindingService = game:GetService("PathfindingService")
 
-	local WALK_LOOKAHEAD = 50
 	local WAYPOINT_REACHED = 8
 	local ROUTE_MOVED = 25
 	local ROUTE_RETRY = 2
+	local ROUTE_LOST = 60
 
 	local route = { goal = nil, points = nil, index = 1, busy = false, failedAt = 0 }
 
@@ -882,23 +915,73 @@ function Module.Build(ctx)
 		return (Vector3.new(a.X, 0, a.Z) - Vector3.new(b.X, 0, b.Z)).Magnitude
 	end
 
-	-- The waypoint about fifty studs along from here, so the order is given
-	-- rarely and the path is still followed.
+	-- How far along the path to aim, which is the thing that decides whether the
+	-- character follows the route or leans on a wall next to it.
+	--
+	-- Aiming fifty studs ahead regardless is what parked it against
+	-- "COLLISIONS.GUARD NO COLLIDE.WALL RIGHT" for a whole minute with a valid
+	-- three hundred waypoint path to Volcano in hand and MoveDirection pointing
+	-- east. On a route that turns, the point fifty studs along is *through* the
+	-- corner, and steering at a point through a wall walks into the wall.
+	--
+	-- The fifty was inherited from the MoveTo version, where each new target was
+	-- an order that interrupted the humanoid's acceleration and so had to be
+	-- given rarely. Steering does not issue orders, it sets a direction per
+	-- frame, and changing that costs nothing. So aim as far ahead as can
+	-- actually be seen, and no further.
+	local WALK_LOOKAHEAD_STEPS = 10
+	local sightParams = RaycastParams.new()
+	sightParams.FilterType = Enum.RaycastFilterType.Exclude
+	sightParams.IgnoreWater = true
+
+	local function canSee(from, to)
+		local character = LocalPlayer.Character
+		sightParams.FilterDescendantsInstances = character and { character } or {}
+		local eye = from + Vector3.new(0, 2, 0)
+		local aim = Vector3.new(to.X, from.Y + 2, to.Z)
+		local reach = aim - eye
+		if reach.Magnitude < 0.5 then
+			return true
+		end
+		return Workspace:Raycast(eye, reach, sightParams) == nil
+	end
+
 	local function lookAhead(from)
 		local points = route.points
 		if not points then
 			return nil
 		end
-		while route.index < #points and flatDistance(points[route.index].Position, from) <= WAYPOINT_REACHED do
+
+		-- Move to whichever waypoint ahead is nearest, rather than stepping one
+		-- at a time. At a hundred and twenty studs a second a tenth of a second
+		-- covers twelve studs and the waypoints are four apart, so stepping one
+		-- at a time leaves the aim pointing at something already behind us.
+		local nearest, nearestAt = route.index, math.huge
+		for i = route.index, math.min(route.index + 16, #points) do
+			local distance = flatDistance(points[i].Position, from)
+			if distance < nearestAt then
+				nearest, nearestAt = i, distance
+			end
+		end
+		-- A long way from every waypoint means the route is about a journey we
+		-- are no longer on: shoved by a guard, knocked off a ledge, teleported.
+		-- Throw it away rather than steering back to a path that has stopped
+		-- being the shortest way anywhere.
+		if nearestAt > ROUTE_LOST then
+			clearRoute()
+			return nil
+		end
+		route.index = nearest
+		if nearestAt <= WAYPOINT_REACHED and route.index < #points then
 			route.index = route.index + 1
 		end
-		local run, pick = 0, route.index
-		for i = route.index, #points do
-			pick = i
-			run = run + flatDistance(points[i].Position, i > 1 and points[i - 1].Position or from)
-			if run >= WALK_LOOKAHEAD then
+
+		local pick = route.index
+		for i = route.index + 1, math.min(route.index + WALK_LOOKAHEAD_STEPS, #points) do
+			if not canSee(from, points[i].Position) then
 				break
 			end
+			pick = i
 		end
 		return points[pick], points[route.index]
 	end
@@ -1038,6 +1121,84 @@ function Module.Build(ctx)
 		return nearTreadmill()
 	end
 
+	-- Standing on the treadmill instead of farming, and when a night is better
+	-- spent that way.
+	--
+	-- "Try to understand if you are at a level where you need better money, so
+	-- you are going to spend as much time on the treadmill as possible." The
+	-- treadmill pays Speed Power, Speed Power is the gate on every area, and the
+	-- areas are where the money is. Volcano wants 900K and Abyss Ocean wants
+	-- 2.5M, and an Abyss egg is worth a tier more than a Volcano one for as long
+	-- as it lives.
+	--
+	-- Measured on a Golden treadmill: about four thousand Speed Power a second
+	-- standing on it, against about fourteen hundred while farming - walking
+	-- pays Speed too, so the farm is never standing still on this. Three times
+	-- faster, and no eggs. Which makes the answer: grind only when it buys the
+	-- next area, and only when the next area is close enough to reach in a
+	-- sitting rather than over a night.
+	--
+	-- The rate is measured rather than assumed, because it multiplies by eighty
+	-- across the treadmill ladder and the number below is one rung of it.
+	local TREADMILL_RATE = 4000
+	local TREADMILL_PATIENCE = 900
+
+	local rate = { estimate = TREADMILL_RATE, at = 0, power = nil }
+
+	local function watchTreadmillRate(power)
+		if not treadmill.active then
+			rate.at, rate.power = 0, nil
+			return
+		end
+		local now = os.clock()
+		if not rate.power then
+			rate.at, rate.power = now, power
+			return
+		end
+		local span = now - rate.at
+		if span < 15 then
+			return
+		end
+		local seen = (power - rate.power) / span
+		rate.at, rate.power = now, power
+		if seen > 1 then
+			-- Slowly, so one unlucky window does not talk it out of a rung it
+			-- has actually bought.
+			rate.estimate = rate.estimate * 0.7 + seen * 0.3
+		end
+	end
+
+	-- The next sign above us, and how long the treadmill would take to reach it.
+	local function nextAreaGap()
+		readSigns()
+		local power = mySpeedPower()
+		local need, id = nil, nil
+		for area, sign in pairs(AREA_NEEDS) do
+			if sign > power and (not need or sign < need) then
+				need, id = sign, area
+			end
+		end
+		if not need then
+			return nil
+		end
+		return need - power, id, need
+	end
+
+	local function worthGrinding()
+		local gap, area = nextAreaGap()
+		if not gap then
+			return false
+		end
+		return gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE, area, gap
+	end
+
+	local function treadmillSpot()
+		local data = plotData()
+		local folder = data and data.PlotFolder
+		local bottom = folder and folder:FindFirstChild("TreadmillBottom", true)
+		return bottom and bottom:IsA("BasePart") and bottom.Position or nil
+	end
+
 	local function leaveTreadmill()
 		if not onTreadmill() then
 			return false
@@ -1097,7 +1258,15 @@ function Module.Build(ctx)
 	-- covered any ground, something is holding it: the treadmill, almost always.
 	local stuckFrom, stuckAt = nil, nil
 
+	-- Standing still on purpose is not being stuck, and the treadmill is the one
+	-- place where the two look identical.
+	local grinding = false
+
 	local function watchForStuck()
+		if grinding then
+			stuckFrom = nil
+			return
+		end
 		local root = core:Root()
 		if not root then
 			return
@@ -1116,6 +1285,15 @@ function Module.Build(ctx)
 				-- tick work out a new one. Asking the server about it would be
 				-- asking the wrong party.
 				clearRoute()
+				-- And jump, because a good half of these are a lip an inch high
+				-- that the humanoid will not walk up and will hop over without
+				-- being asked twice.
+				local hum = core:Humanoid()
+				if hum then
+					pcall(function()
+						hum:ChangeState(Enum.HumanoidStateType.Jumping)
+					end)
+				end
 			end
 		end
 	end
@@ -1193,6 +1371,38 @@ function Module.Build(ctx)
 			end
 			goHome()
 			return
+		end
+
+		-- Hands empty, so the question is what the next hour is worth more spent
+		-- on. Almost always eggs. Occasionally the treadmill, when the next area
+		-- is one sitting away and a whole tier of egg is on the other side of it.
+		if F.speedGrind ~= false then
+			local grind, area, gap = worthGrinding()
+			if grind then
+				local spot = treadmillSpot()
+				if spot then
+					if not grinding then
+						grinding = true
+						currentTarget = nil
+						core:Notify(
+							"Meridian",
+							("Riding the treadmill for %s, %s of Speed to go"):format(tostring(area), short(gap)),
+							6
+						)
+					end
+					if walkTo(spot, 3) then
+						stopWalking()
+					end
+					return
+				end
+			end
+		end
+
+		if grinding then
+			grinding = false
+			-- Off it deliberately, or the farm walks its next trip at treadmill
+			-- pace, which is no pace at all.
+			leaveTreadmill()
 		end
 
 		-- Not carrying, so find something worth walking to.
@@ -1409,9 +1619,23 @@ function Module.Build(ctx)
 	-- nothing at all, and growing Speed makes you faster *and* widens what the
 	-- movement anti-cheat will accept. A developed account already walks at
 	-- around 98, six times the default, entirely legitimately.
+	-- Upgrading the treadmill is the largest single lever in the game and it is
+	-- one call. The ladder runs x2 free, x5 for 15K, x12 for 250K, x30 for 5M,
+	-- x80 for 120M, x100 for 3B, and on up to x2000. Each step multiplies how
+	-- fast Speed grows, Speed is the gate on every area, and the areas are where
+	-- the money is. Buying it the minute it is affordable is never wrong.
+	--
+	-- It is also the easiest way to spend all night asking for something you
+	-- cannot afford, so a refusal counts as a refusal and the gate backs it off.
 	core:Loop("speed", 5, function()
+		watchTreadmillRate(mySpeedPower())
 		if F.speedUpgrade and due("treadmill", 20) then
-			ask(NET.Treadmills.REQUEST_UPGRADE)
+			if ask(NET.Treadmills.REQUEST_UPGRADE) then
+				accepted("treadmill")
+				core:Notify("Meridian", "Bought the next treadmill", 4)
+			else
+				refused("treadmill", 20)
+			end
 		end
 	end)
 
@@ -1800,6 +2024,11 @@ function Module.Build(ctx)
 				short(currentTarget.worth),
 				math.floor(currentTarget.distance)
 			)
+		elseif grinding then
+			local _, area, gap = worthGrinding()
+			core.Headline = area
+				and ("Treadmill · %s of Speed to %s"):format(short(gap or 0), area)
+				or "On the treadmill"
 		elseif F.autoSteal then
 			core.Headline = chosenArea
 				and ("Farming %s · nothing worth taking yet"):format(chosenArea)
@@ -2018,6 +2247,14 @@ function Module.Build(ctx)
 	}, "baseHatch")
 
 	baseLeft:Toggle({
+		Name = "Equip Best After Hatching",
+		Default = true,
+		Callback = function(state)
+			F.baseBest = state
+		end,
+	}, "baseBest")
+
+	baseLeft:Toggle({
 		Name = "Auto Skip Growth",
 		Default = false,
 		Callback = function(state)
@@ -2102,6 +2339,14 @@ function Module.Build(ctx)
 			F.speedUpgrade = state
 		end,
 	}, "speedUpgrade")
+
+	progLeft:Toggle({
+		Name = "Treadmill For The Next Area",
+		Default = true,
+		Callback = function(state)
+			F.speedGrind = state
+		end,
+	}, "speedGrind")
 
 	progLeft:Divider()
 
