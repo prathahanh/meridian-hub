@@ -273,6 +273,13 @@ core.QueueRelaunch = function()
 	if type(queue) ~= "function" then
 		return false
 	end
+	-- Queueing appends, and this is called again every time the switches change,
+	-- so without clearing first an overnight session arrives in the new server
+	-- and loads the hub a hundred times over the top of itself.
+	local clear = clear_teleport_queue or clearqueueonteleport or cleartpqueue or clearteleportqueue
+	if type(clear) == "function" then
+		pcall(clear)
+	end
 	local carry = ""
 	if type(core.Key) == "string" and core.Key ~= "" then
 		carry = ("getgenv().%sKey = %q "):format(SHORT, core.Key)
@@ -604,6 +611,24 @@ Access.Ask({
 					core:Notify(BRAND, entry.name .. " did not load. " .. why, 12)
 				end)
 				return
+			end
+
+			-- Keep a relaunch queued for whatever teleport comes next, not just
+			-- the ones the hub starts.
+			--
+			-- Steal An Egg moves you on its own: the area egg reset teleports
+			-- everybody, and a server rotates underneath an unattended farm
+			-- several times a night. The hop button used to be the only thing
+			-- that queued anything, so every teleport the hub did not start left
+			-- the account in a fresh server with nothing running, which is the
+			-- difference between a script you can leave on overnight and one you
+			-- have to sit next to. Refreshed on a timer so the switches that
+			-- travel are the ones that are on now.
+			if type(core.QueueRelaunch) == "function" then
+				core.QueueRelaunch()
+				core:Loop("relaunch", 45, function()
+					core.QueueRelaunch()
+				end)
 			end
 
 			ceremony:Finish(function()
