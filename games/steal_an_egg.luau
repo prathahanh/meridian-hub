@@ -639,17 +639,121 @@ function Module.Build(ctx)
 		return false
 	end
 
-	-- Carrying an egg home. Everything about this is deliberately ordinary
-	-- walking: this game resets you to your base for a 60 stud jump, and the
-	-- one thing worse than a slow farm is a farm that keeps getting sent home
-	-- empty handed.
-	local function goHome()
+	-- Walking, and both halves of this were learned the hard way.
+	--
+	-- **MoveTo gives up after eight seconds.** Aiming it at a nest a thousand
+	-- studs away and leaving it alone looks perfect for eight seconds and then
+	-- the character simply stops, forever, because nothing ever asks again. So
+	-- the order is re-issued, but at a point along the exact bearing to the real
+	-- destination rather than at the destination itself, which keeps the path
+	-- dead straight while staying inside what MoveTo will actually finish.
+	--
+	-- **And it is re-issued rarely.** The hub's own walker asks twenty times a
+	-- second, which is right when chasing a player who moves; a nest has not
+	-- moved in an hour, and every fresh order interrupts the humanoid's own
+	-- acceleration. In a game whose entire economy is how fast you cover ground,
+	-- that shuffle is the difference between a good farm and a bad one.
+	local WALK_STEP = 60
+	local WALK_REFRESH = 3.5
+
+	local walkOrder = { at = 0, aim = nil }
+
+	local function walkTo(position, standoff)
+		local root, hum = core:Root(), core:Humanoid()
+		if not root or not hum or hum.Health <= 0 then
+			return false
+		end
+
+		local flat = Vector3.new(position.X - root.Position.X, 0, position.Z - root.Position.Z)
+		local distance = flat.Magnitude
+		if distance <= (standoff or 0) then
+			walkOrder.aim = nil
+			core:SetControls(true)
+			return true
+		end
+
+		core:SetControls(false)
+
+		local now = os.clock()
+		local changed = walkOrder.aim == nil or (position - walkOrder.aim).Magnitude > 10
+		if changed or now - walkOrder.at > WALK_REFRESH then
+			walkOrder.at = now
+			walkOrder.aim = position
+			local reach = math.min(distance - (standoff or 0), WALK_STEP)
+			hum:MoveTo(root.Position + flat.Unit * reach)
+		end
+		return false
+	end
+
+	-- Getting off the treadmill before going anywhere.
+	--
+	-- The treadmill sits fourteen studs from the spawn point, so a farm that has
+	-- just been home is standing on it, and standing on it holds you there: the
+	-- farm issued its walk orders perfectly and did not move a stud for ninety
+	-- seconds. It is also the thing an AFK player is deliberately using, so the
+	-- hub steps off only when it actually has somewhere to be.
+	local function leaveTreadmill()
+		if due("treadmillOff", 2) then
+			pcall(Network.Fire, NET.Treadmills.REQUEST_UNEQUIP)
+		end
+	end
+
+	-- Home is the pet pad, not the spawn point, and the difference is the whole
+	-- of a complaint.
+	--
+	-- RespawnPointCFrame sits about fourteen studs from the treadmill and fifty
+	-- from the pad. Walking there meant arriving on the treadmill every single
+	-- trip - which pulls you into treadmill mode and is exactly what an AFK
+	-- player does not want happening to them - while still being nowhere near
+	-- the place an egg can actually be put down. Go where the egg is going.
+	local homeSpot = nil
+
+	local function homeTarget()
 		local data = plotData()
-		local target = data and data.RespawnPointCFrame
+		local pad = data and data.PetArea
+		if not pad or not pad:IsA("BasePart") then
+			return data and data.RespawnPointCFrame and data.RespawnPointCFrame.Position or nil
+		end
+		-- The near edge rather than the middle, so arriving does not mean
+		-- crossing the whole pad and walking over eggs that are already down.
+		local root = core:Root()
+		if not root then
+			return pad.Position
+		end
+		local toward = pad.CFrame:PointToObjectSpace(root.Position)
+		local half = pad.Size / 2
+		local x = math.clamp(toward.X, -half.X * 0.6, half.X * 0.6)
+		local z = math.clamp(toward.Z, -half.Z * 0.6, half.Z * 0.6)
+		homeSpot = pad.CFrame:PointToWorldSpace(Vector3.new(x, 0, z))
+		return homeSpot
+	end
+
+	local function goHome()
+		local target = homeTarget()
 		if not target then
 			return false
 		end
-		return core:WalkToward(target.Position, 10, tonumber(F.stealSpeed) or 200)
+		return walkTo(target, 6)
+	end
+
+	-- If an order has been standing for a few seconds and the character has not
+	-- covered any ground, something is holding it: the treadmill, almost always.
+	local stuckFrom, stuckAt = nil, nil
+
+	local function watchForStuck()
+		local root = core:Root()
+		if not root then
+			return
+		end
+		local now = os.clock()
+		if not stuckFrom or (root.Position - stuckFrom).Magnitude > 12 then
+			stuckFrom, stuckAt = root.Position, now
+			return
+		end
+		if now - stuckAt > 3 then
+			stuckAt = now
+			leaveTreadmill()
+		end
 	end
 
 	core:Loop("steal", 0.1, function()
@@ -657,8 +761,13 @@ function Module.Build(ctx)
 			if currentTarget then
 				dropTarget()
 			end
+			stuckFrom = nil
 			return
 		end
+
+		-- Anything that holds the character still gets one nudge every few
+		-- seconds. On this map that is the treadmill and only the treadmill.
+		watchForStuck()
 		if not core:Alive2() then
 			dropTarget()
 			return
@@ -727,12 +836,12 @@ function Module.Build(ctx)
 		if me and not insideArea(areaId, me) then
 			local door = areaEntrance(areaId)
 			if door then
-				core:WalkToward(door, 4, tonumber(F.stealSpeed) or 200)
+				walkTo(door, 6)
 				return
 			end
 		end
 
-		local arrived = core:WalkToward(position, STEAL_REACH, tonumber(F.stealSpeed) or 200)
+		local arrived = walkTo(position, STEAL_REACH)
 		if not arrived then
 			return
 		end

@@ -895,9 +895,22 @@ function Core:SetControls(enabled)
 	if self._controlsEnabled == enabled then
 		return
 	end
+	-- FindFirstChild, never WaitForChild.
+	--
+	-- Steal An Egg ships no PlayerModule at all: its PlayerScripts folder is
+	-- empty because the game replaced the default control module with its own.
+	-- WaitForChild on a child that will never arrive does not error, it yields
+	-- forever, and this is called from inside a farm loop - so the whole loop
+	-- thread stopped on its first step and the farm sat still for a minute and a
+	-- half looking like a movement problem. A game without a PlayerModule needs
+	-- this to be a no-op, not a trap.
+	local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+	local module = scripts and scripts:FindFirstChild("PlayerModule")
+	if not module then
+		return
+	end
 	local ok, controls = pcall(function()
-		local PlayerModule = require(LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("PlayerModule"))
-		return PlayerModule:GetControls()
+		return require(module):GetControls()
 	end)
 	if not ok or not controls then
 		return
