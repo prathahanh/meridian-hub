@@ -377,12 +377,31 @@ function Module.Build(ctx)
 	local nextDue = {}
 	local failures = {}
 
+	-- The actions that spend money, which the gate has to treat differently.
+	local BUYING = { treadmill = true, upgrade = true, skip = true, trail = true }
+
+	-- What is in the bank right now, so a purchase that was refused is not asked
+	-- again until there is more money than there was when it said no. Cheaper
+	-- and more honest than knowing every price in the game, and it means a farm
+	-- that cannot afford the next treadmill asks about it once and then not
+	-- again until it has actually earned something.
+	local function money()
+		local stats = LocalPlayer:FindFirstChild("leaderstats")
+		local cash = stats and stats:FindFirstChild("Money")
+		return tonumber(cash and cash.Value) or 0
+	end
+
+	local refusedAt = {}
+
 	local function due(key, interval)
 		local now = os.clock()
 		if now - lastCall < SERVER_GAP then
 			return false
 		end
 		if now < (nextDue[key] or 0) then
+			return false
+		end
+		if BUYING[key] and refusedAt[key] and money() <= refusedAt[key] then
 			return false
 		end
 		lastCall = now
@@ -403,9 +422,34 @@ function Module.Build(ctx)
 	local GIVE_UP_FOR = 600
 	local parked = {}
 
+	-- Anything that costs money is a special case, and getting it wrong cost an
+	-- account ten minutes of bouncing between servers.
+	--
+	-- Auto Upgrade Treadmill asked to buy the next rung every twenty seconds. He
+	-- could not afford it - the one above Golden is three billion - so that was
+	-- twelve refusals in four minutes, which is exactly the shape this game
+	-- kicks for. Money does not arrive in twenty seconds. A refused purchase is
+	-- worth trying again in five minutes and not before, and three in a row is
+	-- enough to stop asking until something changes.
+	local BUYING_AFTER = 3
+	local BUYING_WAIT = 300
+
 	local function refused(key, interval)
 		local count = (failures[key] or 0) + 1
 		failures[key] = count
+		if BUYING[key] then
+			refusedAt[key] = money()
+			if count >= BUYING_AFTER then
+				nextDue[key] = os.clock() + GIVE_UP_FOR
+				if not parked[key] then
+					parked[key] = true
+					warn(("[Meridian] cannot afford %s, leaving it alone for a while"):format(key))
+				end
+			else
+				nextDue[key] = os.clock() + BUYING_WAIT
+			end
+			return count
+		end
 		if count >= GIVE_UP_AFTER then
 			nextDue[key] = os.clock() + GIVE_UP_FOR
 			if not parked[key] then
@@ -422,6 +466,7 @@ function Module.Build(ctx)
 	local function accepted(key)
 		failures[key] = nil
 		parked[key] = nil
+		refusedAt[key] = nil
 		nextDue[key] = nil
 	end
 
