@@ -859,6 +859,13 @@ function Core:ReleaseFacing()
 	self._lockUntil = 0
 end
 
+-- The height of the last place that was safe to stand. Anything a long way
+-- below this is over the edge, which is the only cheap way for a game module to
+-- know that the player it is chasing has gone into the void.
+function Core:SafeHeight()
+	return self._safeHeight
+end
+
 -- Walk toward a position using the character's own legs. This is the only
 -- approach that leaves the physics alone: writing CFrame every frame makes the
 -- solver invent enormous velocities, which is felt in game as being flung on
@@ -1022,9 +1029,16 @@ end
 -- Flying to the target instead of walking to it. Walls, ledges and the whole
 -- problem of pathing across an arena stop existing, and it is physics driven
 -- rather than a teleport, so the server still sees a character that travelled.
+-- Just been pulled out of a fall? Then nothing drives for a moment. Without
+-- this the thing that flew him into the void simply flies him back into it, and
+-- anti void cannot fire again for a second and a half.
+function Core:Recovering()
+	return self.VoidRecoverUntil ~= nil and os.clock() < self.VoidRecoverUntil
+end
+
 function Core:FlyToward(position, standoff, speed)
 	local root, hum = self:Root(), self:Humanoid()
-	if not root or not hum or hum.Health <= 0 then
+	if not root or not hum or hum.Health <= 0 or self:Recovering() then
 		return false
 	end
 
@@ -1063,7 +1077,7 @@ end
 
 function Core:WalkToward(position, standoff, speed)
 	local root, hum = self:Root(), self:Humanoid()
-	if not root or not hum then
+	if not root or not hum or self:Recovering() then
 		return false
 	end
 	standoff = standoff or 0
@@ -1109,7 +1123,7 @@ end
 -- directly. `direct` is that threshold.
 function Core:BlinkTo(position, standoff, maxStep, direct)
 	local root = self:Root()
-	if not root then
+	if not root or self:Recovering() then
 		return false
 	end
 	self._steerUntil = os.clock() + 0.4
@@ -1574,13 +1588,31 @@ function Core:StartAntiVoid(config)
 			return
 		end
 
+		local effectsFolder = Workspace:FindFirstChild("Effects")
+		params.FilterDescendantsInstances = effectsFolder and { char, effectsFolder } or { char }
+
 		if GROUNDED[hum:GetState()] then
 			-- Only every so often, so a save is never taken during the stumble
 			-- off a ledge and then used as the place to put him back.
 			if os.clock() - lastSave > 0.4 then
 				lastSafe, lastSave = root.CFrame, os.clock()
+				self._safeHeight = lastSafe.Position.Y
 			end
 			return
+		end
+
+		-- Airborne, but over something solid and survivable, is still a place
+		-- worth remembering. The farm flies him for minutes at a time and never
+		-- touches the ground once, so without this the only safe point on
+		-- record is wherever he last stood - stale, or on a bad run nil, which
+		-- is the state where anti void silently does nothing.
+		if os.clock() - lastSave > 0.4 then
+			local below = Workspace:Raycast(root.Position, Vector3.new(0, -probe, 0), params)
+			if below and (not deadly or not deadly(below.Instance)) then
+				lastSafe = CFrame.new(below.Position + Vector3.new(0, 3, 0))
+				lastSave = os.clock()
+				self._safeHeight = lastSafe.Position.Y
+			end
 		end
 
 		if not self.Flags.antiVoid or not lastSafe then
@@ -1605,9 +1637,6 @@ function Core:StartAntiVoid(config)
 			return
 		end
 
-		local effects = Workspace:FindFirstChild("Effects")
-		params.FilterDescendantsInstances = effects and { char, effects } or { char }
-
 		local hit = Workspace:Raycast(root.Position, Vector3.new(0, -probe, 0), params)
 
 		if hit then
@@ -1630,6 +1659,16 @@ function Core:StartAntiVoid(config)
 		root.CFrame = lastSafe + Vector3.new(0, 5, 0)
 		root.AssemblyLinearVelocity = Vector3.zero
 		hum:ChangeState(Enum.HumanoidStateType.GettingUp)
+
+		-- And nothing steers for a moment afterwards. Dropping the held
+		-- velocity is not enough on its own, because whatever was steering is
+		-- still running and writes a fresh one on its next tick; the approaches
+		-- check this window and refuse to move while it holds.
+		self._steerVelocity = nil
+		self._steerVelocityUntil = nil
+		self._steerUntil = nil
+		self.VoidRecoverUntil = os.clock() + 1.2
+
 		self:Notify("Anti void", "Caught you on the way down", 2)
 	end)
 end

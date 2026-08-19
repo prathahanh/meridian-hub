@@ -231,12 +231,41 @@ function Module.Build(ctx)
 		return entry ~= nil and (os.clock() - entry.since) >= SETTLE_WAIT
 	end
 
+	-- Somebody who has been knocked off the map is not a target, they are a
+	-- hole in the ground with a name on it.
+	--
+	-- A tester found this: knock the player you are hunting into the void and
+	-- the farm follows them down, because their root still reports a position
+	-- and the chase happily flies to it. Anti void would catch the fall and the
+	-- chase would immediately fly back into it, so sometimes it saved him and
+	-- sometimes he died. Three things were wrong and this is the first of them:
+	-- **nothing should ever chase a position below the floor.**
+	local VOID_DROP = 40
+
+	local function overTheEdge(model)
+		local theirs = model:FindFirstChild("HumanoidRootPart")
+		if not theirs then
+			return true
+		end
+		local floor = core:SafeHeight()
+		if not floor then
+			-- Nothing known to compare against yet, so fall back to our own
+			-- height, which is at least somewhere the game let us be.
+			local mine = core:Root()
+			floor = mine and mine.Position.Y or nil
+		end
+		if not floor then
+			return false
+		end
+		return theirs.Position.Y < floor - VOID_DROP
+	end
+
 	local function targets()
 		local out = {}
 		local mine = core:Character()
 		for _, model in ipairs(CollectionService:GetTagged("Character")) do
 			if model ~= mine and model.Parent and model:GetAttribute("Deployed") and inPlace(model) then
-				if not (F.ignoreStar and model:GetAttribute("StarMode")) then
+				if not (F.ignoreStar and model:GetAttribute("StarMode")) and not overTheEdge(model) then
 					out[#out + 1] = model
 				end
 			end
@@ -2224,6 +2253,11 @@ function Module.Build(ctx)
 			if not theirs:GetAttribute("Deployed") then
 				currentTarget = nil
 				sayOnce("lobby", name .. " is standing in the lobby")
+				return
+			end
+			if overTheEdge(theirs) then
+				currentTarget = nil
+				sayOnce("void", name .. " went off the map, not following them down")
 				return
 			end
 			if not inPlace(theirs) then
