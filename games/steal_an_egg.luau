@@ -445,6 +445,40 @@ function Module.Build(ctx)
 	-- actually is, and if it is not there, do nothing and say so.
 	local NetworkFolder = ReplicatedStorage:FindFirstChild("Network")
 
+	-- Nothing in the farm tick may wait on the server, and this is not theory.
+	--
+	-- Treadmills.REQUEST_UNEQUIP proved it. Called from the tick while the
+	-- character was anchored to a treadmill, InvokeServer never came back. The
+	-- farm stopped where it stood with its legs still running on the spot, the
+	-- headline said "Planting it" for four minutes, and every later call queued
+	-- behind the one that was never going to answer. A loop that ticks ten times
+	-- a second cannot be the thread that waits for a reply that may not come.
+	--
+	-- So a request goes out on its own thread with a deadline. The tick gets the
+	-- answer if one arrives in time and "no answer" if not, which is a perfectly
+	-- good answer here because every action is on a gate that will try again.
+	local ANSWER_WITHIN = 2.5
+
+	local function answerWithin(fn, ...)
+		local args = table.pack(...)
+		local state = { done = false }
+		task.spawn(function()
+			local ok, value, reason = pcall(fn, table.unpack(args, 1, args.n))
+			state.ok, state.value, state.reason, state.done = ok, value, reason, true
+		end)
+		local deadline = os.clock() + ANSWER_WITHIN
+		while not state.done and os.clock() < deadline do
+			task.wait()
+		end
+		if not state.done then
+			return false, "the server did not answer"
+		end
+		if not state.ok then
+			return false, tostring(state.value)
+		end
+		return state.value ~= false, state.reason
+	end
+
 	local function ask(action, ...)
 		if type(action) ~= "string" then
 			return false, "no such action"
@@ -459,11 +493,7 @@ function Module.Build(ctx)
 			return false, "this game has no " .. action
 		end
 		if remote:IsA("RemoteFunction") then
-			local ok, reply, reason = pcall(Network.Invoke, action, ...)
-			if not ok then
-				return false, tostring(reply)
-			end
-			return reply ~= false, reason
+			return answerWithin(Network.Invoke, action, ...)
 		end
 		if remote:IsA("RemoteEvent") then
 			local ok, err = pcall(Network.Fire, action, ...)
@@ -834,8 +864,9 @@ function Module.Build(ctx)
 			refused("place", PLACE_INTERVAL)
 			return false, "No base yet"
 		end
-		local ok, took, reason = pcall(EggCmds.RequestPlaceEgg, uid, localCFrame)
-		if ok and took then
+		local took, reason = answerWithin(EggCmds.RequestPlaceEgg, uid, localCFrame)
+		local ok = true
+		if took then
 			accepted("place")
 			placeAttempt = 0
 			stats.placed = stats.placed + 1
@@ -1199,6 +1230,38 @@ function Module.Build(ctx)
 		return bottom and bottom:IsA("BasePart") and bottom.Position or nil
 	end
 
+	-- Getting off, which matters more than it sounds: a treadmill anchors the
+	-- root part, so a farm that steps on one on the way out of its own base and
+	-- cannot get off again is a farm that has finished for the night. The path
+	-- out of the base runs straight over it.
+	--
+	-- The remote is the first try and it is the one that hung. The second try is
+	-- the game's own route: it binds UserInputService.JumpRequest and calls the
+	-- same remote from there with its own in-flight guard, so running those
+	-- handlers is a player pressing space rather than us racing the game on one
+	-- RemoteFunction. Real's firesignal is a silent no-op, but getconnections
+	-- hands back the functions themselves, and native input is no use here
+	-- because it needs the window focused and an unattended farm's window is not.
+	local UserInputService = game:GetService("UserInputService")
+
+	local function jumpOff()
+		local list = getconnections and getconnections(UserInputService.JumpRequest)
+		if type(list) ~= "table" or #list == 0 then
+			return false
+		end
+		for _, connection in ipairs(list) do
+			local handler = connection.Function
+			if type(handler) == "function" then
+				-- Spawned, because the game's own handler invokes the server and
+				-- we are not going to wait on it either.
+				task.spawn(function()
+					pcall(handler)
+				end)
+			end
+		end
+		return true
+	end
+
 	local function leaveTreadmill()
 		if not onTreadmill() then
 			return false
@@ -1210,10 +1273,13 @@ function Module.Build(ctx)
 		if ok then
 			treadmill.active = false
 			accepted("treadmillOff")
-		else
-			refused("treadmillOff", 4)
+			return true
 		end
-		return ok
+		local count = refused("treadmillOff", 4)
+		if count >= 2 then
+			jumpOff()
+		end
+		return false
 	end
 
 	-- Home is the pet pad, not the spawn point, and the difference is the whole
@@ -1465,8 +1531,9 @@ function Module.Build(ctx)
 		-- as a plain false with a reason; some others are raised. Treating pcall
 		-- succeeding as the egg being taken counted every refusal as a win, which
 		-- is why the farm reported nothing and stood still.
-		local ok, took, reason = pcall(EggCmds.RequestCarryAreaEgg, currentTarget.record.Uid)
-		if ok and took ~= false then
+		local took, reason = answerWithin(EggCmds.RequestCarryAreaEgg, currentTarget.record.Uid)
+		local ok = true
+		if took then
 			accepted("carry")
 			stats.taken = stats.taken + 1
 			stats.earned = stats.earned + currentTarget.worth
