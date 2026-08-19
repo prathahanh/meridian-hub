@@ -296,16 +296,31 @@ function Module.Build(ctx)
 		return (ok and tonumber(value)) or 0
 	end
 
-	local function canHandle(areaId)
+	-- Which areas to farm, in order, best first.
+	--
+	-- This is a different question from which egg is best, and answering the
+	-- wrong one is what he caught: it walked past Volcano to take an egg out of
+	-- Snow, because that one Snow egg happened to be worth more than anything
+	-- Volcano had spawned that minute. Wrong trade. The walk costs the same
+	-- either way, Volcano's eggs are worth far more on average, and a farm
+	-- running all night lives on the average, not on one lucky spawn.
+	--
+	-- The sign is both the gate and the ranking. 11, 900, 10K, 40K, 170K, 900K,
+	-- 2.5M, 17M, 700M: the order of the numbers is the order of the areas, so
+	-- the highest sign we pass is where we belong.
+	local function areasByTier()
 		readSigns()
-		local needed = AREA_NEEDS[areaId]
-		if not needed then
-			-- No sign read yet is not permission. Until the world has streamed in
-			-- far enough to say, the only areas worth trusting are the cheap ones,
-			-- and being wrong here costs a wasted trip and a stolen egg.
-			return areaNeedsCount > 0
+		local power = mySpeedPower()
+		local out = {}
+		for id, needed in pairs(AREA_NEEDS) do
+			if needed <= power then
+				out[#out + 1] = { id = id, needed = needed }
+			end
 		end
-		return mySpeedPower() >= needed
+		table.sort(out, function(a, b)
+			return a.needed > b.needed
+		end)
+		return out
 	end
 
 	local function eggPosition(record)
@@ -373,9 +388,30 @@ function Module.Build(ctx)
 		return true
 	end
 
+	-- Backing off is not the same as stopping, and for something meant to run all
+	-- night the difference is the whole game.
+	--
+	-- Doubling the wait and capping it at thirty seconds means an action that
+	-- can never succeed settles into asking once every thirty seconds - which is
+	-- a hundred and twenty an hour, nine hundred and sixty overnight, all of them
+	-- refused. That is the exact shape this game kicks for, delivered slowly. So
+	-- past a dozen refusals in a row it stops asking at all for ten minutes, and
+	-- the next thing that succeeds clears the count.
+	local GIVE_UP_AFTER = 12
+	local GIVE_UP_FOR = 600
+	local parked = {}
+
 	local function refused(key, interval)
 		local count = (failures[key] or 0) + 1
 		failures[key] = count
+		if count >= GIVE_UP_AFTER then
+			nextDue[key] = os.clock() + GIVE_UP_FOR
+			if not parked[key] then
+				parked[key] = true
+				warn(("[Meridian] %s has been refused %d times, leaving it alone for a while"):format(key, count))
+			end
+			return count
+		end
 		local ceiling = BACKOFF_MAX[key] or BACKOFF_CAP
 		nextDue[key] = os.clock() + math.min(interval * (2 ^ count), ceiling)
 		return count
@@ -383,6 +419,7 @@ function Module.Build(ctx)
 
 	local function accepted(key)
 		failures[key] = nil
+		parked[key] = nil
 		nextDue[key] = nil
 	end
 
@@ -520,6 +557,10 @@ function Module.Build(ctx)
 	-- Everything the farm knows about the map, ranked, once per tick. Kept as
 	-- one function so the ESP and the farm cannot ever disagree about which egg
 	-- is the good one - they read the same list.
+	-- Which area the farm settled on, so the interface can say so rather than
+	-- leaving him to work it out from where the character is standing.
+	local chosenArea = nil
+
 	local function rankedEggs()
 		local me = myPosition()
 		if not me then
@@ -540,26 +581,53 @@ function Module.Build(ctx)
 		local mode = F.stealPick or "Most Valuable"
 		local mutatedOnly = F.stealMutated == true
 
-		local out = {}
+		-- Everything takeable, bucketed by area, so the area can be chosen before
+		-- the egg is.
+		local byArea = {}
 		for _, record in ipairs(cachedSnapshot().Records) do
 			local position = eggPosition(record)
 			if position and record.State == "Slot" and not isStarterEgg(record) then
 				local distance = (position - me).Magnitude
 				local worth = eggWorth(record)
 				local mutations = mutationList(record)
-						local pass = distance <= reach
+				local pass = distance <= reach
 					and worth >= floor
 					and (not allowedSet or allowedSet[record.AreaId])
 					and (not mutatedOnly or #mutations > 0)
-					and (F.stealOutrun == false or canHandle(record.AreaId))
 				if pass then
-					out[#out + 1] = {
+					local bucket = byArea[record.AreaId]
+					if not bucket then
+						bucket = {}
+						byArea[record.AreaId] = bucket
+					end
+					bucket[#bucket + 1] = {
 						record = record,
 						position = position,
 						distance = distance,
 						worth = worth,
 						mutations = mutations,
 					}
+				end
+			end
+		end
+
+		-- Settle the area first. The best area we can get out of, and if it has
+		-- nothing worth taking this minute, the next one down rather than
+		-- standing still. Only when the gate is switched off does it go back to
+		-- ranking every egg on the map against every other, which is the thing
+		-- that sent it to Snow.
+		local out = {}
+		if F.stealOutrun == false then
+			for _, bucket in pairs(byArea) do
+				table.move(bucket, 1, #bucket, #out + 1, out)
+			end
+		else
+			for _, area in ipairs(areasByTier()) do
+				local bucket = byArea[area.id]
+				if bucket and #bucket > 0 then
+					out = bucket
+					chosenArea = area.id
+					break
 				end
 			end
 		end
@@ -637,12 +705,39 @@ function Module.Build(ctx)
 		accepted("carry")
 	end
 
-	-- Somewhere on your own base to put an egg down. The game raycasts from
-	-- wherever the player is pointing; a farm has nobody pointing, so it picks
-	-- its own spot and lets the server say no. Spread over the pad rather than
-	-- stacked on the middle, because the server refuses a spot that is already
-	-- taken and one that walks outward finds a free one in a couple of tries
-	-- instead of never.
+	-- The egg you carried home is not the egg you plant, and that one sentence
+	-- is why nothing was ever planted.
+	--
+	-- An area egg in transit is a carry state: a uid on a signal, no Tool
+	-- anywhere. The moment you cross into your own plot the server claims it,
+	-- and *then* it becomes a Tool with ItemType "AssetEgg" and a UID attribute
+	-- of its own - a different uid from the area egg's. Placement wants that
+	-- one. Passing the area uid gets a polite refusal forever.
+	--
+	-- Measured: carry uid FirstAreaEgg_699240826_5957263_Volcano:Slot_004,
+	-- tool uid 236f63e8eedc402ea0a4584c916490ce, and the second one placed.
+	local function heldEggTool()
+		local character = LocalPlayer.Character
+		local pack = LocalPlayer:FindFirstChild("Backpack")
+		for _, place in ipairs({ character, pack }) do
+			for _, item in ipairs(place and place:GetChildren() or {}) do
+				if item:IsA("Tool") and item:GetAttribute("ItemType") == "AssetEgg" then
+					local uid = item:GetAttribute("UID")
+					if type(uid) == "string" then
+						return uid, item
+					end
+				end
+			end
+		end
+		return nil
+	end
+
+	-- Somewhere on your own base to put it down. The game raycasts from wherever
+	-- the player is pointing; a farm has nobody pointing, so it picks its own
+	-- spot. Under your own feet first, because you are standing on the pad and
+	-- that spot is reachable by definition; then a spiral outward, because the
+	-- server refuses a spot that is already taken and walking outward finds a
+	-- free one in a couple of tries instead of never.
 	local placeAttempt = 0
 
 	local function placementCFrame(data)
@@ -650,13 +745,32 @@ function Module.Build(ctx)
 		if not pad or not pad:IsA("BasePart") then
 			return nil
 		end
+		local half = pad.Size / 2
+		local root = core:Root()
+		local base = pad.Position
+		if root then
+			local relative = pad.CFrame:PointToObjectSpace(root.Position)
+			base = pad.CFrame:PointToWorldSpace(Vector3.new(
+				math.clamp(relative.X, -half.X * 0.85, half.X * 0.85),
+				0,
+				math.clamp(relative.Z, -half.Z * 0.85, half.Z * 0.85)
+			))
+		end
+		local world = base
+		if placeAttempt > 0 then
+			-- A spiral, so consecutive attempts are never neighbours and a full
+			-- row does not have to be walked one stud at a time.
+			local turn = placeAttempt * 2.399963
+			local out = math.min(placeAttempt * 2.4, math.min(half.X, half.Z) * 0.9)
+			world = base + Vector3.new(math.cos(turn) * out, 0, math.sin(turn) * out)
+			local relative = pad.CFrame:PointToObjectSpace(world)
+			world = pad.CFrame:PointToWorldSpace(Vector3.new(
+				math.clamp(relative.X, -half.X * 0.9, half.X * 0.9),
+				0,
+				math.clamp(relative.Z, -half.Z * 0.9, half.Z * 0.9)
+			))
+		end
 		placeAttempt = placeAttempt + 1
-		-- A spiral, so consecutive attempts are never neighbours and a full row
-		-- does not have to be walked one stud at a time.
-		local turn = placeAttempt * 2.399963
-		local out = math.min(placeAttempt * 1.6, math.min(pad.Size.X, pad.Size.Z) * 0.45)
-		local offset = Vector3.new(math.cos(turn) * out, 0, math.sin(turn) * out)
-		local world = pad.Position + offset
 		return data.CenterPoint.CFrame:ToObjectSpace(CFrame.new(world))
 	end
 
@@ -674,6 +788,13 @@ function Module.Build(ctx)
 		if not data or not data.CenterPoint then
 			refused("place", PLACE_INTERVAL)
 			return false, "No base yet"
+		end
+		-- The server only takes it from someone standing on their own plot, and
+		-- refusing to ask from outside is cheaper than being told.
+		local root = core:Root()
+		local here = root and PlotCmds.IsWorldPositionWithinLocalPlotBounds(root.Position)
+		if not here then
+			return false, "Not home yet"
 		end
 		local localCFrame = placementCFrame(data)
 		if not localCFrame then
@@ -868,9 +989,32 @@ function Module.Build(ctx)
 	-- to take us off a treadmill we were seventeen studs away from, about thirty
 	-- times, which is precisely the shape of thing that gets an account kicked -
 	-- a request that cannot possibly succeed, repeated.
+	-- Standing near a treadmill is not standing on one, and that difference got
+	-- the account kicked again.
+	--
+	-- The proximity guess said "on it" for anything within twelve studs of
+	-- TreadmillBottom, and the pet pad is inside that circle. So the moment the
+	-- farm walked home to plant an egg and stood still to do it, the stuck
+	-- watcher decided it was stuck on the treadmill and asked the server to take
+	-- it off, every four seconds, for as long as it stood there. An impossible
+	-- request on repeat, which is the one thing this game reliably kicks for.
+	--
+	-- The server says so itself: ActiveTreadmillChanged fires with the treadmill
+	-- you are on, or with nothing when you get off. Ask the game, not the map.
+	local treadmill = { active = nil }
+
+	do
+		local ok, signal = pcall(Network.Fired, NET.Treadmills.ACTIVE_TREADMILL_EVENT)
+		if ok and type(signal) == "table" and signal.Connect then
+			core:Connect(signal, function(which)
+				treadmill.active = which ~= nil
+			end)
+		end
+	end
+
 	local TREADMILL_RANGE = 12
 
-	local function onTreadmill()
+	local function nearTreadmill()
 		local root = core:Root()
 		local data = plotData()
 		local folder = data and data.PlotFolder
@@ -884,13 +1028,31 @@ function Module.Build(ctx)
 		return (bottom.Position - root.Position).Magnitude <= TREADMILL_RANGE
 	end
 
+	local function onTreadmill()
+		if treadmill.active ~= nil then
+			return treadmill.active
+		end
+		-- The event has never fired, which is what a hub loaded while already
+		-- standing on one looks like. Proximity is all there is until it does,
+		-- and being wrong once is survivable where being wrong forever is not.
+		return nearTreadmill()
+	end
+
 	local function leaveTreadmill()
 		if not onTreadmill() then
-			return
+			return false
 		end
-		if due("treadmillOff", 4) then
-			ask(NET.Treadmills.REQUEST_UNEQUIP)
+		if not due("treadmillOff", 4) then
+			return false
 		end
+		local ok = ask(NET.Treadmills.REQUEST_UNEQUIP)
+		if ok then
+			treadmill.active = false
+			accepted("treadmillOff")
+		else
+			refused("treadmillOff", 4)
+		end
+		return ok
 	end
 
 	-- Home is the pet pad, not the spawn point, and the difference is the whole
@@ -947,7 +1109,14 @@ function Module.Build(ctx)
 		end
 		if now - stuckAt > 3 then
 			stuckAt = now
-			leaveTreadmill()
+			if not leaveTreadmill() then
+				-- Not the treadmill, so it is the path: a route computed from
+				-- somewhere we are no longer standing, or one that runs into
+				-- something that has since moved. Throw it away and let the next
+				-- tick work out a new one. Asking the server about it would be
+				-- asking the wrong party.
+				clearRoute()
+			end
 		end
 	end
 
@@ -972,31 +1141,57 @@ function Module.Build(ctx)
 			return
 		end
 
+		-- A trip has three states, not two, and the third one is the one that was
+		-- missing: an egg that is already yours and is still in your hands.
+		--
+		--   carrying  - an area egg in transit, walk it home
+		--   holding   - claimed on arrival, now a Tool, walk to the pad and plant
+		--   neither   - go find one
+		--
+		-- Holding is checked first. Crossing into the plot ends the carry and
+		-- starts the hold in the same instant, and a farm that only knows about
+		-- carrying reads that as "trip over" and walks straight back out with
+		-- the egg still in its hands. Which is exactly what he watched happen.
+		local eggUid, eggTool = heldEggTool()
+		if eggUid then
+			currentTarget = nil
+			if F.basePlace == false then
+				return
+			end
+			-- On the pad, not merely inside the fence. The plot is big and the
+			-- pad is the part of it an egg can go on.
+			if not goHome() then
+				return
+			end
+			local hum = core:Humanoid()
+			if eggTool and eggTool.Parent ~= LocalPlayer.Character and hum then
+				pcall(function()
+					hum:EquipTool(eggTool)
+				end)
+			end
+			local placed, reason, gaveUp = tryPlace(eggUid)
+			if placed then
+				stopWalking()
+			elseif gaveUp then
+				-- A base that is full is the one refusal the user has to do
+				-- something about, and by this point it has been refused six times,
+				-- so it is not bad luck.
+				sayOnce("place", "Could not plant it", tostring(reason))
+			end
+			return
+		end
+
 		local held = carriedUid()
 		if held then
-			-- Carrying. Nothing else matters until it is down.
+			-- Carrying. Nothing else matters until it is home.
 			currentTarget = nil
 			if F.stealCarryHome == false then
 				return
 			end
-			local data = plotData()
-			if not data then
+			if not plotData() then
 				return
 			end
-			local arrived = goHome()
-			if not arrived then
-				return
-			end
-			if F.basePlace == false then
-				return
-			end
-			local placed, reason, gaveUp = tryPlace(held)
-			if not placed and gaveUp then
-				-- A base that is full is the one refusal the user has to do
-				-- something about, and by this point it has been refused six times,
-				-- so it is not bad luck.
-				sayOnce("place", "Could not place it", tostring(reason))
-			end
+			goHome()
 			return
 		end
 
@@ -1103,22 +1298,42 @@ function Module.Build(ctx)
 	-- base
 	----------------------------------------------------------------------------
 
+	-- Your own eggs, and only yours.
+	--
+	-- The first version read GetRuntimeSnapshot, which is every player's eggs
+	-- keyed by owner, and then looked for a Uid field on each entry. There is no
+	-- Uid field: the uid is the key. So it returned an empty list every time and
+	-- auto hatch has never once hatched anything. GetOwnerRuntimeRecords asks
+	-- the question that was meant.
 	local function ownEggs()
-		local ok, runtime = pcall(EggCmds.GetRuntimeSnapshot)
-		if not ok or type(runtime) ~= "table" then
+		local ok, records = pcall(EggCmds.GetOwnerRuntimeRecords, LocalPlayer.UserId)
+		if not ok or type(records) ~= "table" then
 			return {}
 		end
 		local out = {}
-		for _, slot in pairs(runtime) do
-			if type(slot) == "table" then
-				for _, record in pairs(slot) do
-					if type(record) == "table" and record.Uid then
-						out[#out + 1] = record
-					end
-				end
+		for uid, record in pairs(records) do
+			if type(uid) == "string" and type(record) == "table" then
+				out[#out + 1] = { uid = uid, record = record }
 			end
 		end
 		return out
+	end
+
+	-- "If it beats what you have, keep it. No space, so throw out the worst and
+	-- plant the better one." The game does exactly that on one button, and its
+	-- own idea of better is the one the pen actually pays out on, so there is
+	-- nothing to reimplement. It debounces at five seconds on the server, so
+	-- asking faster than that only earns a refusal.
+	local function equipBest()
+		if not due("equipBest", 8) then
+			return
+		end
+		local ok = ask(NET.Backpack.EQUIP_BEST)
+		if ok then
+			accepted("equipBest")
+		else
+			refused("equipBest", 8)
+		end
 	end
 
 	-- One egg per pass, not every egg every pass. A full base is twenty-odd
@@ -1127,12 +1342,20 @@ function Module.Build(ctx)
 	-- fast spread out, because the growth timer is the thing that takes minutes.
 	core:Loop("base", 2, function()
 		if F.baseHatch and due("hatch", 2.5) then
-			for _, record in ipairs(ownEggs()) do
-				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, record.Uid))
+			for _, egg in ipairs(ownEggs()) do
+				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, egg.uid))
 				if ready == true then
-					pcall(EggCmds.RequestHatchEgg, record.Uid)
-					task.wait(0.5)
-					pcall(EggCmds.RequestCompleteHatchEgg, record.Uid)
+					local ok, hatched = pcall(EggCmds.RequestHatchEgg, egg.uid)
+					if ok and hatched ~= false then
+						task.wait(0.5)
+						pcall(EggCmds.RequestCompleteHatchEgg, egg.uid)
+						stats.hatched = (stats.hatched or 0) + 1
+						-- A new pet is the only moment the answer to "what should
+						-- be out in the pen" can have changed.
+						if F.baseBest ~= false then
+							equipBest()
+						end
+					end
 					break
 				end
 			end
@@ -1142,10 +1365,10 @@ function Module.Build(ctx)
 		-- so this is the one most likely to be refused over and over. One egg,
 		-- slowly, and the gate backs it off further every time it is turned down.
 		if F.baseSkip and due("skip", 4) then
-			for _, record in ipairs(ownEggs()) do
-				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, record.Uid))
+			for _, egg in ipairs(ownEggs()) do
+				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, egg.uid))
 				if ready ~= true then
-					local ok, took = pcall(EggCmds.RequestSkipGrowth, record.Uid)
+					local ok, took = pcall(EggCmds.RequestSkipGrowth, egg.uid)
 					if ok and took ~= false then
 						accepted("skip")
 					else
@@ -1171,12 +1394,8 @@ function Module.Build(ctx)
 	-- pets
 	----------------------------------------------------------------------------
 
-	local function equipBest()
-		return ask(NET.Backpack.EQUIP_BEST)
-	end
-
 	core:Loop("pets", 6, function()
-		if F.petsEquipBest and due("equipBest", 30) then
+		if F.petsEquipBest then
 			equipBest()
 		end
 	end)
@@ -1569,8 +1788,11 @@ function Module.Build(ctx)
 		carried.Holding = perSecond and (short(perSecond.Value) .. " a second") or "nothing yet"
 		core.Stats = carried
 
+		local eggUid = heldEggTool()
 		local held = carriedUid()
-		if held then
+		if eggUid then
+			core.Headline = "Planting it"
+		elseif held then
 			core.Headline = "Carrying one home"
 		elseif currentTarget then
 			core.Headline = ("%s · %s a second · %d studs away"):format(
@@ -1579,7 +1801,9 @@ function Module.Build(ctx)
 				math.floor(currentTarget.distance)
 			)
 		elseif F.autoSteal then
-			core.Headline = "Looking for something worth the walk"
+			core.Headline = chosenArea
+				and ("Farming %s · nothing worth taking yet"):format(chosenArea)
+				or "Looking for something worth the walk"
 		else
 			core.Headline = nil
 		end
