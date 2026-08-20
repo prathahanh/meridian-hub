@@ -58,6 +58,8 @@ Module.Tips = {
 	["Sell Everything"] = "Sells your whole inventory except favourites. There is no undo.",
 	["Auto Treadmill"] = "Stands on the treadmill and keeps earning Speed while you are not doing anything else.",
 	["Auto Upgrade Treadmill"] = "Buys the next treadmill whenever you can afford it.",
+	["Treadmill When Eggs Are Poor"] = "When nothing on the map would move the needle, stands on the treadmill instead of walking fifteen hundred studs for an egg worth a rounding error.",
+	["Worth The Walk"] = "How much an egg has to add to what you already earn before it is worth the trip. A species you have never hatched always is, whatever it earns.",
 	["Treadmill For The Next Area"] = "When the next area is one sitting away on the treadmill, goes and stands on it until you can get in, then goes back to farming.",
 	["Auto Rebirth"] = "Rebirths as soon as the game lets you.",
 	["Rebirth Now"] = "Rebirths, right now.",
@@ -1353,6 +1355,7 @@ function Module.Build(ctx)
 	-- Standing still on purpose is not being stuck, and the treadmill is the one
 	-- place where the two look identical.
 	local grinding = false
+	local grindReason = nil
 
 	-- Walk around the treadmill rather than over it.
 	--
@@ -1597,7 +1600,7 @@ function Module.Build(ctx)
 	-- The rate is measured rather than assumed, because it multiplies by eighty
 	-- across the treadmill ladder and the number below is one rung of it.
 	local TREADMILL_RATE = 4000
-	local TREADMILL_PATIENCE = 900
+	local TREADMILL_PATIENCE = 1800
 
 	local rate = { estimate = TREADMILL_RATE, at = 0, power = nil }
 
@@ -1640,12 +1643,52 @@ function Module.Build(ctx)
 		return need - power, id, need
 	end
 
-	local function worthGrinding()
-		local gap, area = nextAreaGap()
-		if not gap then
+	-- What you earn right now, which is the only sensible yardstick for whether
+	-- an egg is worth walking to.
+	local function moneyRate()
+		local stats = LocalPlayer:FindFirstChild("leaderstats")
+		local per = stats and stats:FindFirstChild("Money/s")
+		return tonumber(per and per.Value) or 0
+	end
+
+	-- Is anything on the map worth the trip, or is the treadmill a better use of
+	-- the next few minutes?
+	--
+	-- He watched it walk fifteen hundred studs for an egg worth 191 a second
+	-- while earning twenty-one million a second, and said what anyone would:
+	-- that is not going to do anything. He is right. An egg that adds a rounding
+	-- error to what you already make is not worth the walk, and the treadmill
+	-- pays the same four thousand Speed a second whatever the map looks like.
+	--
+	-- A species never hatched is always worth it, whatever it earns, because
+	-- that reward is paid once and there is no second chance at it.
+	local function worthTheTrip(egg)
+		if not egg then
 			return false
 		end
-		return gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE, area, gap
+		if egg.fresh then
+			return true
+		end
+		local share = (tonumber(F.stealShare) or 2) / 100
+		local earning = moneyRate()
+		if earning <= 0 or share <= 0 then
+			return true
+		end
+		return egg.worth >= earning * share
+	end
+
+	-- Two reasons to be standing on it, and the second one is the one he asked
+	-- for: the next area is a sitting away, or there is nothing out there worth
+	-- the walk.
+	local function worthGrinding(best)
+		local gap, area = nextAreaGap()
+		if gap and gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE then
+			return true, ("%s of Speed to %s"):format(short(gap), area), area, gap
+		end
+		if F.speedIdle ~= false and not worthTheTrip(best) then
+			return true, "nothing out there worth the walk", area, gap
+		end
+		return false, nil, area, gap
 	end
 
 	-- Getting off, which matters more than it sounds: a treadmill anchors the
@@ -2018,19 +2061,16 @@ function Module.Build(ctx)
 		-- on. Almost always eggs. Occasionally the treadmill, when the next area
 		-- is one sitting away and a whole tier of egg is on the other side of it.
 		if F.speedGrind ~= false then
-			local grind, area, gap = worthGrinding()
+			local grind, why = worthGrinding(rankedEggs()[1])
 			if grind then
 				local spot = treadmillSpot()
 				if spot then
 					if not grinding then
 						grinding = true
 						currentTarget = nil
-						core:Notify(
-							"Meridian",
-							("Riding the treadmill for %s, %s of Speed to go"):format(tostring(area), short(gap)),
-							6
-						)
+						core:Notify("Meridian", "On the treadmill · " .. tostring(why), 6)
 					end
+					grindReason = why
 					if walkTo(spot, 3) then
 						stopWalking()
 					end
@@ -2561,34 +2601,58 @@ function Module.Build(ctx)
 		highlight.Enabled = false
 		highlight.Parent = espHolder
 
-		-- Drawing rather than a Beam or a frame, because it is one screen space
-		-- line a frame and costs nothing next to a part. Allocated here with
-		-- everything else: a loop thread cannot make one either.
-		local tracer = nil
-		pcall(function()
-			tracer = Drawing.new("Line")
-			tracer.Thickness = 1
-			tracer.Transparency = 1
-			tracer.Visible = false
-		end)
+		-- Drawn in the world rather than on the screen, which is the whole
+		-- difference between these and the ones he called slow and snappy.
+		--
+		-- A Drawing line is a 2D overlay: it starts at the same place on screen
+		-- however you are looking, it has to be re-projected every time the
+		-- camera moves, and re-projecting it three times a second - which is how
+		-- often the egg list is rebuilt - is a line that jumps rather than
+		-- follows. A CylinderHandleAdornment is real geometry. It runs from your
+		-- root to the egg, turns with the world on its own, and AlwaysOnTop
+		-- still draws it through walls. It is the same thing Ability Arena uses,
+		-- which is the one he said looks right.
+		local tracer = Instance.new("CylinderHandleAdornment")
+		tracer.Radius = 0.06
+		tracer.AlwaysOnTop = true
+		tracer.ZIndex = 0
+		tracer.Transparency = 0.35
+		tracer.Visible = false
+		tracer.Parent = espHolder
 
 		espPool[#espPool + 1] = {
 			billboard = billboard,
 			label = label,
 			highlight = highlight,
 			tracer = tracer,
+			target = nil,
+			colour = nil,
 		}
 	end
 
-	-- Drawing objects are not parented to anything, so nothing collects them and
-	-- a reload leaves a second set of lines on screen forever.
-	core:Track(function()
+	-- Every frame, not three times a second. The list of which eggs matter is
+	-- rebuilt slowly because that is a search; where the line has to be drawn
+	-- changes every time the camera moves, which is sixty times faster.
+	core:Connect(RunService.Heartbeat, function()
+		local myRoot = core:Root()
+		local on = F.eggEsp and F.eggEspTracers == true and myRoot ~= nil
 		for _, mark in ipairs(espPool) do
-			if mark.tracer then
-				pcall(function()
+			local target = on and mark.target or nil
+			if target and target.Parent then
+				local relative = myRoot.CFrame:PointToObjectSpace(target.Position)
+				local length = relative.Magnitude
+				if length > 0.5 then
+					mark.tracer.Adornee = myRoot
+					mark.tracer.Height = length
+					mark.tracer.CFrame = CFrame.lookAt(Vector3.zero, relative) * CFrame.new(0, 0, -length / 2)
+					mark.tracer.Color3 = mark.colour or Color3.fromRGB(255, 255, 255)
+					mark.tracer.Visible = true
+				else
 					mark.tracer.Visible = false
-					mark.tracer:Remove()
-				end)
+				end
+			elseif mark.tracer.Visible then
+				mark.tracer.Visible = false
+				mark.tracer.Adornee = nil
 			end
 		end
 	end)
@@ -2634,16 +2698,14 @@ function Module.Build(ctx)
 	local function hideFrom(index)
 		for slot = index, ESP_POOL do
 			local mark = espPool[slot]
-			if not mark.billboard.Enabled and not mark.highlight.Enabled and not (mark.tracer and mark.tracer.Visible) then
+			if not mark.billboard.Enabled and not mark.highlight.Enabled and not mark.target then
 				break
 			end
 			mark.billboard.Enabled = false
 			mark.highlight.Enabled = false
 			mark.billboard.Adornee = nil
 			mark.highlight.Adornee = nil
-			if mark.tracer then
-				mark.tracer.Visible = false
-			end
+			mark.target = nil
 		end
 	end
 
@@ -2674,8 +2736,6 @@ function Module.Build(ctx)
 		local fill = math.clamp((tonumber(F.eggEspFill) or 15) / 100, 0, 1)
 		local tracers = F.eggEspTracers == true
 		local onlyNew = F.eggEspOnlyNew == true
-		local camera = Workspace.CurrentCamera
-		local origin = camera and Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
 
 		local slot = 0
 		for _, egg in ipairs(ranked) do
@@ -2733,21 +2793,10 @@ function Module.Build(ctx)
 					mark.billboard.Enabled = true
 					mark.highlight.Enabled = true
 
-					if mark.tracer then
-						if tracers and camera and origin then
-							local point, onScreen = camera:WorldToViewportPoint(anchor.Position)
-							if onScreen then
-								mark.tracer.Color = colour
-								mark.tracer.From = origin
-								mark.tracer.To = Vector2.new(point.X, point.Y)
-								mark.tracer.Visible = true
-							else
-								mark.tracer.Visible = false
-							end
-						else
-							mark.tracer.Visible = false
-						end
-					end
+					-- The tracer itself is drawn on Heartbeat above; all this has
+					-- to do is say where and what colour.
+					mark.target = tracers and anchor or nil
+					mark.colour = colour
 				end
 			end
 		end
@@ -2829,10 +2878,7 @@ function Module.Build(ctx)
 				math.floor(currentTarget.distance)
 			)
 		elseif grinding then
-			local _, area, gap = worthGrinding()
-			core.Headline = area
-				and ("Treadmill · %s of Speed to %s"):format(short(gap or 0), area)
-				or "On the treadmill"
+			core.Headline = "Treadmill · " .. tostring(grindReason or "earning Speed")
 		elseif F.autoSteal then
 			core.Headline = chosenArea
 				and ("Farming %s · nothing worth taking yet"):format(chosenArea)
@@ -3188,6 +3234,26 @@ function Module.Build(ctx)
 			F.speedGrind = state
 		end,
 	}, "speedGrind")
+
+	progLeft:Toggle({
+		Name = "Treadmill When Eggs Are Poor",
+		Default = true,
+		Callback = function(state)
+			F.speedIdle = state
+		end,
+	}, "speedIdle")
+
+	progLeft:Slider({
+		Name = "Worth The Walk",
+		Default = 2,
+		Minimum = 0,
+		Maximum = 25,
+		DisplayMethod = "Percent",
+		Precision = 0,
+		Callback = function(value)
+			F.stealShare = value
+		end,
+	}, "stealShare")
 
 	progLeft:Divider()
 
