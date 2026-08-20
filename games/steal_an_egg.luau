@@ -31,6 +31,7 @@ local Module = {
 Module.Tips = {
 	["Auto Steal"] = "Walks to an egg, takes it, brings it home and puts it down. Then goes again.",
 	["Pick By"] = "What makes an egg worth the walk.",
+	["Walk Like A Keyboard"] = "WASD only has eight directions, so that is all a desktop player ever moves in. This snaps to the same eight instead of walking at any angle it likes. Whether this game cares is a guess, so it is off until the kick log says otherwise.",
 	["New Species First"] = "Goes for anything missing from your index before anything else, wherever it is. That reward is paid once, it is usually worth more than a night of farming, and there is no second chance at a first hatch.",
 	["Claim Everything"] = "Asks for every index reward you have earned, right now.",
 	["Equip Best Bat"] = "Puts on the bat from the best area you have finished the index for.",
@@ -1272,6 +1273,46 @@ function Module.Build(ctx)
 	-- rather than walked through, harder the closer it is to dead ahead.
 	local TREADMILL_CLEAR = 20
 
+	-- Walking the way a keyboard walks.
+	--
+	-- WASD has eight combinations, so a desktop player's MoveDirection is always
+	-- one of eight directions relative to the camera. Ours is any angle at all,
+	-- held perfectly steady, for hours. Whether this game looks at that is a
+	-- guess - the kick message is generic and the check is server side - but it
+	-- is the cleanest difference there is between us and a person, and snapping
+	-- to the eight costs a 22 degree error that a path correction absorbs
+	-- immediately.
+	--
+	-- Off by default, because it is a guess. The kick log is what will settle
+	-- it: leave it on for a night, leave it off for a night, compare.
+	local function likeAKeyboard(direction)
+		if F.stealHuman ~= true then
+			return direction
+		end
+		local camera = Workspace.CurrentCamera
+		if not camera then
+			return direction
+		end
+		local look = camera.CFrame.LookVector
+		local ahead = Vector3.new(look.X, 0, look.Z)
+		if ahead.Magnitude < 0.01 then
+			return direction
+		end
+		ahead = ahead.Unit
+		local right = Vector3.new(-ahead.Z, 0, ahead.X)
+		-- sin(22.5 degrees), which is where one key stops and two begin.
+		local EDGE = 0.3827
+		local forward = direction:Dot(ahead)
+		local across = direction:Dot(right)
+		local f = (forward > EDGE and 1) or (forward < -EDGE and -1) or 0
+		local r = (across > EDGE and 1) or (across < -EDGE and -1) or 0
+		if f == 0 and r == 0 then
+			return direction
+		end
+		local out = ahead * f + right * r
+		return out.Magnitude > 0.01 and out.Unit or direction
+	end
+
 	local function dodgeTreadmill(from, direction)
 		if grinding then
 			return direction
@@ -1360,7 +1401,7 @@ function Module.Build(ctx)
 			steer.direction = nil
 			return false
 		end
-		steer.direction = dodgeTreadmill(root.Position, flat.Unit)
+		steer.direction = likeAKeyboard(dodgeTreadmill(root.Position, flat.Unit))
 		return false
 	end
 
@@ -1699,13 +1740,48 @@ function Module.Build(ctx)
 	-- at: whether it is the requests or the character.
 	local KICK_LOG = "Meridian/kicks.txt"
 
+	-- What the farm was doing, in enough detail to be worth reading later.
+	--
+	-- The first version wrote "doing: nothing" and that told us nothing at all.
+	-- The kick message itself is generic - "removed for cheating, CODE BAC-6517"
+	-- - and the code is server side, so the only way to work out what set it off
+	-- is a record of what was happening each time. Every switch that was on,
+	-- how much had been taken and how recently, where the character was and how
+	-- fast: one of those columns will be the same on every line.
+	local function whatWasHappening()
+		local bits = {}
+		bits[#bits + 1] = "doing=" .. tostring(core.Headline or "idle")
+		bits[#bits + 1] = ("took=%d planted=%d in %dm"):format(
+			stats.taken, stats.placed, math.floor((os.clock() - stats.started) / 60))
+		local root, hum = core:Root(), core:Humanoid()
+		if root then
+			bits[#bits + 1] = ("at=%d,%d"):format(root.Position.X, root.Position.Z)
+			bits[#bits + 1] = "anchored=" .. tostring(root.Anchored)
+		end
+		if hum then
+			bits[#bits + 1] = ("ws=%d moving=%s"):format(hum.WalkSpeed, tostring(hum.MoveDirection.Magnitude > 0.1))
+		end
+		bits[#bits + 1] = "area=" .. tostring(chosenArea or "none")
+		bits[#bits + 1] = "grinding=" .. tostring(grinding)
+		bits[#bits + 1] = "onTreadmill=" .. tostring(treadmill.active)
+		bits[#bits + 1] = "flagged=" .. tostring(flagged.count)
+		local switches = {}
+		for _, control in ipairs(core.Controls or {}) do
+			if control.flag and core.Flags[control.flag] == true then
+				switches[#switches + 1] = control.flag
+			end
+		end
+		table.sort(switches)
+		bits[#bits + 1] = "on=" .. table.concat(switches, ",")
+		return table.concat(bits, " | ")
+	end
+
 	local function noteKick(reason)
 		local newline = string.char(10)
-		local line = ("%s | %s | doing: %s | flagged %d times this session"):format(
+		local line = ("%s | %s | %s"):format(
 			os.date("%Y-%m-%d %H:%M:%S"),
 			tostring(reason):gsub("%s+", " "),
-			tostring(core.Headline or "nothing"),
-			flagged.count
+			whatWasHappening()
 		) .. newline
 		warn("[Meridian] kicked: " .. line)
 		pcall(function()
@@ -2752,6 +2828,14 @@ function Module.Build(ctx)
 			F.stealPick = value
 		end,
 	}, "stealPick")
+
+	stealRight:Toggle({
+		Name = "Walk Like A Keyboard",
+		Default = false,
+		Callback = function(state)
+			F.stealHuman = state
+		end,
+	}, "stealHuman")
 
 	stealRight:Toggle({
 		Name = "New Species First",
