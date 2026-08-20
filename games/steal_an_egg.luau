@@ -31,6 +31,8 @@ local Module = {
 Module.Tips = {
 	["Auto Steal"] = "Walks to an egg, takes it, brings it home and puts it down. Then goes again.",
 	["Pick By"] = "What makes an egg worth the walk.",
+	["Only If You Can Get Away"] = "Waits for the guard to be somewhere else instead of taking an egg and losing it a second later. Uses the game's own escape maths against where the guard is standing right now, so it knows before it grabs.",
+	["Eggs A Minute"] = "A hard ceiling on how often an egg can be taken, whatever else says it is fine. The walk usually takes longer than this anyway, so it only bites when something has gone wrong.",
 	["Walk Like A Keyboard"] = "WASD only has eight directions, so that is all a desktop player ever moves in. This snaps to the same eight instead of walking at any angle it likes. Whether this game cares is a guess, so it is off until the kick log says otherwise.",
 	["New Species First"] = "Goes for anything missing from your index before anything else, wherever it is. That reward is paid once, it is usually worth more than a night of farming, and there is no second chance at a first hatch.",
 	["Claim Everything"] = "Asks for every index reward you have earned, right now.",
@@ -115,6 +117,7 @@ function Module.Build(ctx)
 	local AssetGen = require(Library:WaitForChild("Util"):WaitForChild("AssetGenerationUtil"))
 	local Assets = require(Directory:WaitForChild("Assets"))
 	local Areas = require(Directory:WaitForChild("Areas"))
+	local Guards = require(Directory:WaitForChild("Guards"))
 
 	----------------------------------------------------------------------------
 	-- what an egg is worth
@@ -381,6 +384,95 @@ function Module.Build(ctx)
 			end
 		end
 		return door.Position
+	end
+
+	-- Whether we would actually get out with it, which is a different question
+	-- from whether we are fast enough for the area.
+	--
+	-- The sign at the mouth answers the second one and the farm has been obeying
+	-- it. But it kept taking eggs with the guard standing right there, losing
+	-- them a second later, and taking another: twelve grabs in three minutes on
+	-- the run that got the account kicked, six of them dropped. No person plays
+	-- like that. A person waits for the guard to wander off.
+	--
+	-- So this runs the game's own escape model against where the guard is
+	-- standing right now. He sleeps for the waking duration after you take one,
+	-- you carry at about nine tenths speed, and after that it is a plain
+	-- pursuit: if he is faster than you, he closes the head start at the
+	-- difference, and the only question is whether the fence arrives first.
+	local GuardConfig = Guards.Directory or Guards
+	local WAKING = 0.63
+	do
+		local ok, policy = pcall(require, ReplicatedStorage.Library.Modules.GuardAreas.GuardChasePolicy)
+		if ok and type(policy) == "table" and type(policy.GetWakingDuration) == "function" then
+			local fine, value = pcall(policy.GetWakingDuration)
+			if fine and tonumber(value) then
+				WAKING = value
+			end
+		end
+	end
+
+	local CARRY_SLOWDOWN = 0.9
+	-- Arrive with room to spare rather than by a stride. A photo finish is a
+	-- lost egg most of the time, because the guard does not run in a straight
+	-- line and neither do we.
+	local ESCAPE_MARGIN = 1.3
+
+	local function guardPart(areaId)
+		local model = areaModel(areaId)
+		local guard = model and model:FindFirstChild("Guard")
+		if not guard then
+			return nil
+		end
+		return guard.PrimaryPart
+			or guard:FindFirstChild("HumanoidRootPart")
+			or guard:FindFirstChildWhichIsA("BasePart")
+	end
+
+	local function willEscape(areaId, from)
+		if F.stealEscape == false then
+			return true
+		end
+		local model = areaModel(areaId)
+		local door = model and model:FindFirstChild("ClosestExitPoint")
+		local guard = guardPart(areaId)
+		if not door or not guard then
+			-- No door or no guard rendered yet is not a reason to stand still.
+			return true
+		end
+
+		local config = GuardConfig[areaId]
+		local guardSpeed = tonumber(type(config) == "table" and config.WalkSpeed) or 60
+		local hitDistance = tonumber(type(config) == "table" and config.HitDistance) or 4
+
+		local hum = core:Humanoid()
+		local mySpeed = (hum and hum.WalkSpeed or 16) * CARRY_SLOWDOWN
+		if mySpeed <= 1 then
+			return false
+		end
+
+		local exit = Vector3.new(door.Position.X, from.Y, door.Position.Z)
+		local away = exit - from
+		local run = away.Magnitude
+		if run < 1 then
+			return true
+		end
+		local exitTime = run / mySpeed
+		if exitTime <= WAKING then
+			-- Out of the fence before he has opened his eyes.
+			return true
+		end
+
+		local toGuard = Vector3.new(guard.Position.X, from.Y, guard.Position.Z)
+		local lead = (from - toGuard):Dot(away.Unit) + mySpeed * WAKING
+		if lead <= hitDistance then
+			return false
+		end
+		if mySpeed >= guardSpeed then
+			return true
+		end
+		local closeIn = (lead - hitDistance) / (guardSpeed - mySpeed)
+		return (WAKING + closeIn) > exitTime * ESCAPE_MARGIN
 	end
 
 	local function mySpeedPower()
@@ -943,6 +1035,7 @@ function Module.Build(ctx)
 	local currentTarget = nil
 	local targetSince = 0
 	local nextAttempt = 0
+	local lastCarryAt = 0
 	local lastSaid = {}
 
 	local function sayOnce(key, title, body)
@@ -2001,6 +2094,31 @@ function Module.Build(ctx)
 		if os.clock() < nextAttempt then
 			return
 		end
+
+		-- Standing next to it is not the same as being able to get away with it.
+		-- Wait for the guard to be somewhere else rather than taking it and
+		-- losing it, which is both the difference between six eggs and twelve
+		-- grabs and the difference between farming and looking like a script.
+		if me and not willEscape(areaId, me) then
+			stopWalking()
+			if os.clock() - targetSince > 20 then
+				sayOnce("guard", "Waiting on a guard", ("%s is standing on it"):format(tostring(areaId)))
+				dropTarget()
+			end
+			return
+		end
+
+		-- A ceiling on how often an egg can be taken at all, whatever else says
+		-- it is fine. Twelve in three minutes is what a kick looks like from the
+		-- outside; a person doing well gets one every twenty or thirty seconds,
+		-- and the walk takes longer than that anyway, so this only ever bites
+		-- when something has gone wrong.
+		local perMinute = math.clamp(tonumber(F.stealCeiling) or 5, 1, 30)
+		local window = 60 / perMinute
+		if os.clock() - lastCarryAt < window then
+			return
+		end
+
 		if not due("carry", math.max(tonumber(F.stealDelay) or 0.2, 0.5)) then
 			return
 		end
@@ -2017,6 +2135,7 @@ function Module.Build(ctx)
 		local ok = true
 		if took then
 			accepted("carry")
+			lastCarryAt = os.clock()
 			stats.taken = stats.taken + 1
 			stats.earned = stats.earned + currentTarget.worth
 			core:Notify(
@@ -2828,6 +2947,26 @@ function Module.Build(ctx)
 			F.stealPick = value
 		end,
 	}, "stealPick")
+
+	stealRight:Toggle({
+		Name = "Only If You Can Get Away",
+		Default = true,
+		Callback = function(state)
+			F.stealEscape = state
+		end,
+	}, "stealEscape")
+
+	stealRight:Slider({
+		Name = "Eggs A Minute",
+		Default = 5,
+		Minimum = 1,
+		Maximum = 30,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.stealCeiling = value
+		end,
+	}, "stealCeiling")
 
 	stealRight:Toggle({
 		Name = "Walk Like A Keyboard",
