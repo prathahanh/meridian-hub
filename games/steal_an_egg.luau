@@ -793,6 +793,47 @@ function Module.Build(ctx)
 	-- egg in its hands. Both symptoms, one wrong question.
 	local carrying = { active = false, uid = nil, slowedTo = 1 }
 
+	-- Losing an egg is the observable that matters, and until now nothing
+	-- counted it.
+	--
+	-- The run that got the account kicked was twelve grabs and six losses: the
+	-- farm stood in the guard's reach taking, being hit, and taking again. The
+	-- guard check ahead of the grab should stop most of that, but a rule that is
+	-- sometimes wrong needs something behind it, and this is the honest signal.
+	-- Three in five minutes means whatever the prediction thinks, it is losing,
+	-- so it goes home and earns Speed for a while instead. Which is both safer
+	-- and what a person would do after being caught three times.
+	local losses = { at = {}, cooling = 0 }
+	local LOSS_WINDOW = 300
+	local LOSS_LIMIT = 3
+	local LOSS_COOLDOWN = 240
+
+	-- Filled in further down, once there is something to ask about a Tool and
+	-- somewhere to count it. The signal has to be connected here, before the
+	-- interface exists, or the connection never gets made at all.
+	local onCarryEnded = nil
+
+	local function noteLoss()
+		local now = os.clock()
+		local kept = {}
+		for _, when in ipairs(losses.at) do
+			if now - when < LOSS_WINDOW then
+				kept[#kept + 1] = when
+			end
+		end
+		kept[#kept + 1] = now
+		losses.at = kept
+		if #kept >= LOSS_LIMIT then
+			losses.at = {}
+			losses.cooling = now + LOSS_COOLDOWN
+			core:Notify("Meridian", "Lost three in a row. Earning Speed for a bit instead.", 6)
+		end
+	end
+
+	local function beingCareful()
+		return os.clock() < losses.cooling
+	end
+
 	do
 		local signal = EggCmds.AreaEggCarryStateChanged
 		if type(signal) == "table" and signal.Connect then
@@ -800,9 +841,17 @@ function Module.Build(ctx)
 				if type(state) ~= "table" then
 					return
 				end
+				local was = carrying.active
 				carrying.active = state.IsCarrying == true
 				carrying.uid = carrying.active and state.Uid or nil
 				carrying.slowedTo = tonumber(state.SpeedMultiplier) or 1
+
+				-- Carrying stopped. Either it was claimed, which is a Tool
+				-- appearing a moment later, or a guard took it off us. Give the
+				-- claim a moment to show up before calling it a loss.
+				if was and not carrying.active and onCarryEnded then
+					onCarryEnded()
+				end
 			end)
 		end
 	end
@@ -835,7 +884,14 @@ function Module.Build(ctx)
 	-- How much better a lower area has to be before the farm moves to it.
 	local ESCAPE_MULTIPLE = 3
 
-	local function rankedEggs()
+	-- The search that decides which egg matters, and it is not free: every record
+	-- on the map, a worth lookup, a mutation list, an index lookup, a distance
+	-- and two sorts. It used to run twice on every tick of a ten hertz loop plus
+	-- once for the ESP, which is twenty-three full passes a second to answer a
+	-- question whose answer changes when an egg spawns.
+	local rankCache = { at = 0, list = nil }
+
+	local function rankedEggsUncached()
 		local me = myPosition()
 		if not me then
 			return {}
@@ -1013,6 +1069,16 @@ function Module.Build(ctx)
 		return out
 	end
 
+	local function rankedEggs()
+		local now = os.clock()
+		if rankCache.list and now - rankCache.at < 0.25 then
+			return rankCache.list
+		end
+		rankCache.list = rankedEggsUncached()
+		rankCache.at = now
+		return rankCache.list
+	end
+
 	----------------------------------------------------------------------------
 	-- the farm
 	----------------------------------------------------------------------------
@@ -1106,6 +1172,19 @@ function Module.Build(ctx)
 			end
 		end
 		return nil
+	end
+
+	-- Now that there is a Tool to look for, the carry-ended signal above can
+	-- tell a claim from a guard taking it off us.
+	onCarryEnded = function()
+		task.delay(1.2, function()
+			local root = core:Root()
+			local home = root and PlotCmds.IsWorldPositionWithinLocalPlotBounds(root.Position)
+			if not home and not heldEggTool() then
+				stats.lost = (stats.lost or 0) + 1
+				noteLoss()
+			end
+		end)
 	end
 
 	-- Somewhere on your own base to put it down. The game raycasts from wherever
@@ -1662,14 +1741,14 @@ function Module.Build(ctx)
 	--
 	-- A species never hatched is always worth it, whatever it earns, because
 	-- that reward is paid once and there is no second chance at it.
-	local function worthTheTrip(egg)
+	local function worthTheTrip(egg, times)
 		if not egg then
 			return false
 		end
 		if egg.fresh then
 			return true
 		end
-		local share = (tonumber(F.stealShare) or 2) / 100
+		local share = (tonumber(F.stealShare) or 2) / 100 * (times or 1)
 		local earning = moneyRate()
 		if earning <= 0 or share <= 0 then
 			return true
@@ -1682,11 +1761,26 @@ function Module.Build(ctx)
 	-- the walk.
 	local function worthGrinding(best)
 		local gap, area = nextAreaGap()
+		-- Three eggs lost in five minutes means the escape prediction is wrong
+		-- about something, and the answer to that is not to try a fourth time.
+		if beingCareful() then
+			return true, "lost three, letting the guards settle", area, gap
+		end
 		if gap and gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE then
 			return true, ("%s of Speed to %s"):format(short(gap), area), area, gap
 		end
-		if F.speedIdle ~= false and not worthTheTrip(best) then
-			return true, "nothing out there worth the walk", area, gap
+		if F.speedIdle ~= false then
+			-- Hysteresis, because the map changes every few seconds and a farm
+			-- that walks out, turns round, and walks out again gets nothing done
+			-- and looks worse than either choice. Once it is on the treadmill it
+			-- wants twice the reason to leave.
+			local enough = worthTheTrip(best)
+			if grinding then
+				enough = enough and worthTheTrip(best, 2)
+			end
+			if not enough then
+				return true, "nothing out there worth the walk", area, gap
+			end
 		end
 		return false, nil, area, gap
 	end
@@ -2140,9 +2234,18 @@ function Module.Build(ctx)
 		-- losing it, which is both the difference between six eggs and twelve
 		-- grabs and the difference between farming and looking like a script.
 		if me and not willEscape(areaId, me) then
-			stopWalking()
+			-- Wait by the door rather than standing over the egg. Standing still
+			-- inside a guard's reach is how you get hit without even taking
+			-- anything, it is not what a person does, and from the door the run
+			-- out is already half made.
+			local door = areaEntrance(areaId)
+			if door then
+				walkTo(door, 8)
+			else
+				stopWalking()
+			end
 			if os.clock() - targetSince > 20 then
-				sayOnce("guard", "Waiting on a guard", ("%s is standing on it"):format(tostring(areaId)))
+				sayOnce("guard", "Waiting on a guard", ("%s is standing over it"):format(tostring(areaId)))
 				dropTarget()
 			end
 			return
@@ -2862,6 +2965,7 @@ function Module.Build(ctx)
 		carried.Hits = stats.taken
 		carried.Rate = math.floor(stats.taken / minutes * 60)
 		carried.Total = stats.placed
+		carried.Lost = stats.lost or 0
 		carried.Holding = perSecond and (short(perSecond.Value) .. " a second") or "nothing yet"
 		core.Stats = carried
 
