@@ -31,6 +31,9 @@ local Module = {
 Module.Tips = {
 	["Auto Steal"] = "Walks to an egg, takes it, brings it home and puts it down. Then goes again.",
 	["Pick By"] = "What makes an egg worth the walk.",
+	["New Species First"] = "Goes for anything missing from your index before anything else, wherever it is. That reward is paid once, it is usually worth more than a night of farming, and there is no second chance at a first hatch.",
+	["Claim Everything"] = "Asks for every index reward you have earned, right now.",
+	["Equip Best Bat"] = "Puts on the bat from the best area you have finished the index for.",
 	["Stay Where You Win"] = "Settles on the best area your Speed is up to and farms there, using the recommended number on the sign at the mouth of each one. Leaves it only for an egg worth several times more.",
 	["Areas"] = "Which parts of the map it is allowed to go to. Leave them all on and it goes wherever the best egg is.",
 	["Worth At Least"] = "Ignores anything earning less than this. The number is money a second, the same one the game shows on a pet.",
@@ -61,6 +64,16 @@ Module.Tips = {
 	["Auto Lucky Blocks"] = "Opens lucky blocks as they are stored.",
 	["Redeem Codes"] = "Tries every code the game currently has active.",
 	["Egg ESP"] = "Draws every egg on the map through walls, with what it is worth.",
+	["Colour By"] = "Worth shades from grey to green against the best egg on the map. Rarity uses the game's own colours. Index paints anything you have never hatched gold and everything else grey.",
+	["Mark New Species"] = "Puts NEW in front of any egg whose species is missing from your index. Those are worth more than anything else on the map.",
+	["Show Index Reward"] = "Adds the Speed you get for hatching that species for the first time.",
+	["Only New Species"] = "Hides every egg you have already got in the index.",
+	["Show Rarity"] = "Adds Common, Rare, Mythic and so on to each egg.",
+	["Show Area"] = "Adds which area the egg is sitting in.",
+	["Tracers"] = "Draws a line from the bottom of your screen to every egg being shown.",
+	["How Many At Once"] = "How many eggs to draw. Fewer is easier to read when the map is full.",
+	["Text Size"] = "How big the egg names are.",
+	["Fill"] = "How solid the glow on each egg looks. Zero leaves just the outline.",
 	["Show Worth"] = "Adds money a second to each egg, so the filter above is legible.",
 	["Show Distance"] = "Adds how far away each egg is.",
 	["Hide Cheap Eggs"] = "Only draws eggs worth more than your filter, so the screen is not full of Dogs.",
@@ -92,6 +105,7 @@ function Module.Build(ctx)
 
 	local EggCmds = require(Client:WaitForChild("EggCmds"))
 	local PlotCmds = require(Client:WaitForChild("PlotCmds"))
+	local Save = require(Client:WaitForChild("Save"))
 	local Network = require(Client:WaitForChild("Network"))
 
 	local Constants = require(Library:WaitForChild("Globals"):WaitForChild("Constants"))
@@ -117,6 +131,80 @@ function Module.Build(ctx)
 	-- second and the worst was worth 2. Every script that grabs the nearest egg
 	-- is playing a lottery across that range on every single trip, and the walk
 	-- costs the same either way.
+	-- The index, which turns out to be the largest number in this game.
+	--
+	-- Every asset carries an IndexSpeedReward, paid once, the first time you
+	-- ever hatch that species. He has 42 of the 84 and the 42 he is missing add
+	-- up to 40,586,150 Speed Power against the 11.5M he has now - roughly four
+	-- times everything he owns, and the only route past Prehistoric at 17M.
+	--
+	-- Which means the best egg on the map is usually not the most valuable one.
+	-- It is one whose species he has never hatched.
+	local AssetDirectory = Assets.Directory or Assets
+
+	-- Held for a couple of seconds rather than asked for every egg on every
+	-- tick. Forty eggs three times a second is a lot of times to ask the same
+	-- question of a table that changes when you hatch something.
+	local indexCache = { at = 0, map = nil }
+
+	local function indexMap()
+		local now = os.clock()
+		if indexCache.map and now - indexCache.at < 3 then
+			return indexCache.map
+		end
+		local ok, data = pcall(Save.Get)
+		if ok and type(data) == "table" and type(data.Index) == "table" then
+			indexCache.map = data.Index
+			indexCache.at = now
+		end
+		return indexCache.map
+	end
+
+	local function indexHas(category)
+		local map = indexMap()
+		if not map then
+			-- Not knowing is not the same as not having it, and treating unknown
+			-- as new would send the farm chasing everything on the map.
+			return true
+		end
+		return map[category] == true
+	end
+
+	local function indexReward(category)
+		local asset = category and AssetDirectory[category]
+		return (type(asset) == "table" and tonumber(asset.IndexSpeedReward)) or 0
+	end
+
+	-- Where the index actually stands, area by area.
+	--
+	-- Each area carries a DropTable of the species that spawn in it and an
+	-- IndexBatGearId, so finishing an area's drop table is what hands you that
+	-- area's bat. That makes the areas the right grouping and not the rarities,
+	-- which was the first guess.
+	local AreaDirectory = Areas.Directory or Areas
+
+	local function indexProgress()
+		local map = indexMap() or {}
+		local out = {}
+		for id, area in pairs(AreaDirectory) do
+			if type(area) == "table" and type(area.DropTable) == "table" then
+				local row = { got = 0, total = 0, owed = 0, missing = {}, bat = area.IndexBatGearId }
+				for _, entry in ipairs(area.DropTable) do
+					local name = entry[1]
+					row.total = row.total + 1
+					if map[name] then
+						row.got = row.got + 1
+					else
+						row.missing[#row.missing + 1] = name
+						row.owed = row.owed + indexReward(name)
+					end
+				end
+				out[id] = row
+			end
+		end
+		return out
+	end
+
 	local worthCache = {}
 
 	local function eggWorth(record)
@@ -691,12 +779,16 @@ function Module.Build(ctx)
 						bucket = {}
 						byArea[record.AreaId] = bucket
 					end
+					local category = record.AssetCategory
+					local fresh = not indexHas(category)
 					bucket[#bucket + 1] = {
 						record = record,
 						position = position,
 						distance = distance,
 						worth = worth,
 						mutations = mutations,
+						fresh = fresh,
+						reward = fresh and indexReward(category) or 0,
 					}
 				end
 			end
@@ -736,8 +828,19 @@ function Module.Build(ctx)
 			-- the trade goes the other way. Several times, not slightly: one
 			-- lucky Snow egg beating one Volcano egg is not a reason to move
 			-- house, which is the thing he caught it doing.
+			--
+			-- A species never hatched is the other reason to leave, and it does
+			-- not have to beat anything: the index reward is paid once, it is
+			-- worth more than a night of farming, and there is no second chance
+			-- at a first hatch. The biggest one on the map wins, wherever it is.
 			if home then
+				local away, awayReward = nil, 0
 				for _, area in ipairs(tiers) do
+					for _, egg in ipairs(byArea[area.id] or {}) do
+						if egg.fresh and egg.reward > awayReward then
+							away, awayReward = area.id, egg.reward
+						end
+					end
 					if area.id ~= chosenArea then
 						for _, egg in ipairs(byArea[area.id] or {}) do
 							if egg.worth > homeBest * ESCAPE_MULTIPLE then
@@ -747,6 +850,10 @@ function Module.Build(ctx)
 							end
 						end
 					end
+				end
+				if away and F.stealFresh ~= false and away ~= chosenArea then
+					out = byArea[away]
+					chosenArea = away
 				end
 			end
 		end
@@ -758,6 +865,35 @@ function Module.Build(ctx)
 		-- here so the difference is visible. Best Nearby is the one worth
 		-- defaulting to: worth per second of walking, which is the only
 		-- question that has a correct answer when both cost you time.
+		-- A species you have never hatched jumps the queue, in every mode, because
+		-- the reward for it is paid once and never again. Within the new ones it
+		-- is still worth going for the bigger reward first.
+		local prefer = F.stealFresh ~= false
+
+		if prefer then
+			local fresh, rest = {}, {}
+			for _, egg in ipairs(out) do
+				if egg.fresh then
+					fresh[#fresh + 1] = egg
+				else
+					rest[#rest + 1] = egg
+				end
+			end
+			if #fresh > 0 then
+				table.sort(fresh, function(a, b)
+					if a.reward ~= b.reward then
+						return a.reward > b.reward
+					end
+					return a.distance < b.distance
+				end)
+				-- Everything already indexed still gets ranked the usual way and
+				-- kept behind them, so the farm never runs out of work.
+				out = fresh
+				table.move(rest, 1, #rest, #fresh + 1, out)
+				return out
+			end
+		end
+
 		if mode == "Nearest" then
 			table.sort(out, function(a, b)
 				return a.distance < b.distance
@@ -835,6 +971,31 @@ function Module.Build(ctx)
 	--
 	-- Measured: carry uid FirstAreaEgg_699240826_5957263_Volcano:Slot_004,
 	-- tool uid 236f63e8eedc402ea0a4584c916490ce, and the second one placed.
+	-- Every egg you own that is not in the ground yet.
+	--
+	-- The save carries an EggInventory keyed by uid, and an entry with a
+	-- Placement is one already on the pad. He had eleven without one against two
+	-- with - an evening of carrying, sitting in a bag earning nothing - because
+	-- the farm only ever planted what was in its hands on the walk home.
+	-- Anything that arrived another way, or was there before the hub loaded, or
+	-- that a kick interrupted mid-trip, stayed in the bag for good.
+	--
+	-- RequestEquipTool takes one out of the bag from anywhere on the map, so
+	-- there is no walk to add. Only the placing needs you standing on the plot.
+	local function looseEggs()
+		local ok, data = pcall(Save.Get)
+		if not ok or type(data) ~= "table" or type(data.EggInventory) ~= "table" then
+			return {}
+		end
+		local out = {}
+		for uid, record in pairs(data.EggInventory) do
+			if type(uid) == "string" and type(record) == "table" and record.Placement == nil then
+				out[#out + 1] = uid
+			end
+		end
+		return out
+	end
+
 	local function heldEggTool()
 		local character = LocalPlayer.Character
 		local pack = LocalPlayer:FindFirstChild("Backpack")
@@ -1620,7 +1781,8 @@ function Module.Build(ctx)
 		-- carrying reads that as "trip over" and walks straight back out with
 		-- the egg still in its hands. Which is exactly what he watched happen.
 		local eggUid, eggTool = heldEggTool()
-		if eggUid then
+		local bagged = eggUid and 0 or #looseEggs()
+		if eggUid or bagged > 0 then
 			currentTarget = nil
 			if F.basePlace == false then
 				return
@@ -1630,6 +1792,27 @@ function Module.Build(ctx)
 			if not goHome() then
 				return
 			end
+
+			-- Standing on the pad with nothing in hand and eggs in the bag. Take
+			-- one out. This is where the eleven he had been carrying home all
+			-- evening finally go in the ground.
+			if not eggUid and due("unbag", 1.5) then
+				local waiting = looseEggs()
+				local first = waiting[1]
+				if first then
+					local took = answerWithin(EggCmds.RequestEquipTool, first)
+					if took then
+						accepted("unbag")
+						eggUid = first
+					else
+						refused("unbag", 1.5)
+					end
+				end
+			end
+			if not eggUid then
+				return
+			end
+
 			local hum = core:Humanoid()
 			if eggTool and eggTool.Parent ~= LocalPlayer.Character and hum then
 				pcall(function()
@@ -2161,7 +2344,7 @@ function Module.Build(ctx)
 	local espPool = {}
 	for _ = 1, ESP_POOL do
 		local billboard = Instance.new("BillboardGui")
-		billboard.Size = UDim2.fromOffset(240, 34)
+		billboard.Size = UDim2.fromOffset(300, 36)
 		billboard.StudsOffsetWorldSpace = Vector3.new(0, 2.6, 0)
 		billboard.AlwaysOnTop = true
 		billboard.Enabled = false
@@ -2173,6 +2356,7 @@ function Module.Build(ctx)
 		label.Font = Enum.Font.GothamMedium
 		label.TextSize = 15
 		label.TextStrokeTransparency = 0.4
+		label.RichText = true
 		label.Parent = billboard
 
 		local highlight = Instance.new("Highlight")
@@ -2182,10 +2366,41 @@ function Module.Build(ctx)
 		highlight.Enabled = false
 		highlight.Parent = espHolder
 
-		espPool[#espPool + 1] = { billboard = billboard, label = label, highlight = highlight }
+		-- Drawing rather than a Beam or a frame, because it is one screen space
+		-- line a frame and costs nothing next to a part. Allocated here with
+		-- everything else: a loop thread cannot make one either.
+		local tracer = nil
+		pcall(function()
+			tracer = Drawing.new("Line")
+			tracer.Thickness = 1
+			tracer.Transparency = 1
+			tracer.Visible = false
+		end)
+
+		espPool[#espPool + 1] = {
+			billboard = billboard,
+			label = label,
+			highlight = highlight,
+			tracer = tracer,
+		}
 	end
 
-	local function espColour(worth, best)
+	-- Drawing objects are not parented to anything, so nothing collects them and
+	-- a reload leaves a second set of lines on screen forever.
+	core:Track(function()
+		for _, mark in ipairs(espPool) do
+			if mark.tracer then
+				pcall(function()
+					mark.tracer.Visible = false
+					mark.tracer:Remove()
+				end)
+			end
+		end
+	end)
+
+	local NEW_COLOUR = Color3.fromRGB(255, 214, 92)
+
+	local function worthColour(worth, best)
 		if best <= 0 then
 			return Color3.fromRGB(235, 235, 235)
 		end
@@ -2196,16 +2411,44 @@ function Module.Build(ctx)
 		return Color3.fromRGB(150, 150, 150):Lerp(Color3.fromRGB(120, 255, 190), part)
 	end
 
+	-- The game's own rarity colour for the species, which is the one he already
+	-- reads everywhere else in the game.
+	local function rarityOf(category)
+		local asset = category and AssetDirectory[category]
+		local rarity = type(asset) == "table" and asset.Rarity or nil
+		if type(rarity) ~= "table" then
+			return nil, nil
+		end
+		return rarity.Color, rarity.DisplayName
+	end
+
+	local function espColour(egg, best)
+		local mode = F.eggEspColour or "Worth"
+		if mode == "Index" then
+			return egg.fresh and NEW_COLOUR or Color3.fromRGB(140, 150, 160)
+		end
+		if mode == "Rarity" then
+			local colour = rarityOf(egg.record.AssetCategory)
+			if colour then
+				return colour
+			end
+		end
+		return worthColour(egg.worth, best)
+	end
+
 	local function hideFrom(index)
 		for slot = index, ESP_POOL do
 			local mark = espPool[slot]
-			if not mark.billboard.Enabled and not mark.highlight.Enabled then
+			if not mark.billboard.Enabled and not mark.highlight.Enabled and not (mark.tracer and mark.tracer.Visible) then
 				break
 			end
 			mark.billboard.Enabled = false
 			mark.highlight.Enabled = false
 			mark.billboard.Adornee = nil
 			mark.highlight.Adornee = nil
+			if mark.tracer then
+				mark.tracer.Visible = false
+			end
 		end
 	end
 
@@ -2224,14 +2467,30 @@ function Module.Build(ctx)
 		local ranked = rankedEggs()
 		local range = tonumber(F.eggEspRange) or 2500
 		local floor = F.eggEspFilter ~= false and (tonumber(F.stealFloor) or 0) or 0
-		local best = ranked[1] and ranked[1].worth or 0
+		local best = 0
+		for _, egg in ipairs(ranked) do
+			if egg.worth > best then
+				best = egg.worth
+			end
+		end
+
+		local most = math.clamp(tonumber(F.eggEspMax) or ESP_POOL, 1, ESP_POOL)
+		local size = math.clamp(tonumber(F.eggEspSize) or 15, 10, 30)
+		local fill = math.clamp((tonumber(F.eggEspFill) or 15) / 100, 0, 1)
+		local tracers = F.eggEspTracers == true
+		local onlyNew = F.eggEspOnlyNew == true
+		local camera = Workspace.CurrentCamera
+		local origin = camera and Vector2.new(camera.ViewportSize.X / 2, camera.ViewportSize.Y)
 
 		local slot = 0
 		for _, egg in ipairs(ranked) do
-			if slot >= ESP_POOL then
+			if slot >= most then
 				break
 			end
-			if egg.distance <= range and egg.worth >= floor then
+			local wanted = egg.distance <= range
+				and egg.worth >= floor
+				and (not onlyNew or egg.fresh)
+			if wanted then
 				local model = models:FindFirstChild(egg.record.Uid)
 				local anchor = model
 					and (model.PrimaryPart or model:FindFirstChild("Hitbox") or model:FindFirstChildWhichIsA("BasePart"))
@@ -2240,8 +2499,25 @@ function Module.Build(ctx)
 					local mark = espPool[slot]
 
 					local text = eggName(egg.record)
+					if egg.fresh and F.eggEspNewTag ~= false then
+						-- The one thing on this screen worth interrupting a farm
+						-- for, so it is said first and in its own colour.
+						text = ("<font color=\"#FFD65C\">NEW</font> %s"):format(text)
+					end
 					if F.eggEspWorth ~= false then
 						text = text .. " · " .. short(egg.worth)
+					end
+					if F.eggEspRarity then
+						local _, rarity = rarityOf(egg.record.AssetCategory)
+						if rarity then
+							text = text .. " · " .. rarity
+						end
+					end
+					if F.eggEspArea then
+						text = text .. " · " .. tostring(egg.record.AreaId)
+					end
+					if egg.fresh and F.eggEspReward and egg.reward > 0 then
+						text = text .. " · +" .. short(egg.reward) .. " Speed"
 					end
 					if #egg.mutations > 0 then
 						text = text .. " · " .. table.concat(egg.mutations, ", ")
@@ -2250,15 +2526,33 @@ function Module.Build(ctx)
 						text = text .. " · " .. math.floor(egg.distance)
 					end
 
-					local colour = espColour(egg.worth, best)
+					local colour = espColour(egg, best)
 					mark.label.Text = text
 					mark.label.TextColor3 = colour
+					mark.label.TextSize = size
 					mark.highlight.FillColor = colour
 					mark.highlight.OutlineColor = colour
+					mark.highlight.FillTransparency = 1 - fill
 					mark.billboard.Adornee = anchor
 					mark.highlight.Adornee = model
 					mark.billboard.Enabled = true
 					mark.highlight.Enabled = true
+
+					if mark.tracer then
+						if tracers and camera and origin then
+							local point, onScreen = camera:WorldToViewportPoint(anchor.Position)
+							if onScreen then
+								mark.tracer.Color = colour
+								mark.tracer.From = origin
+								mark.tracer.To = Vector2.new(point.X, point.Y)
+								mark.tracer.Visible = true
+							else
+								mark.tracer.Visible = false
+							end
+						else
+							mark.tracer.Visible = false
+						end
+					end
 				end
 			end
 		end
@@ -2384,6 +2678,7 @@ function Module.Build(ctx)
 	local petsRight = petsTab:Section({ Side = "Right" })
 	local progLeft = progressTab:Section({ Side = "Left" })
 	local progRight = progressTab:Section({ Side = "Right" })
+	local indexPanel = progressTab:Section({ Side = "Left" })
 	local visualsLeft = visualsTab:Section({ Side = "Left" })
 	local visualsRight = visualsTab:Section({ Side = "Right" })
 	local playerLeft = playerTab:Section({ Side = "Left" })
@@ -2457,6 +2752,14 @@ function Module.Build(ctx)
 			F.stealPick = value
 		end,
 	}, "stealPick")
+
+	stealRight:Toggle({
+		Name = "New Species First",
+		Default = true,
+		Callback = function(state)
+			F.stealFresh = state
+		end,
+	}, "stealFresh")
 
 	stealRight:Toggle({
 		Name = "Stay Where You Win",
@@ -2721,6 +3024,119 @@ function Module.Build(ctx)
 		end,
 	}, "progLucky")
 
+	--------------------------------------------------------------- the index
+	--
+	-- The largest number in this game, and the one nobody looks at.
+	--
+	-- Every species pays an IndexSpeedReward the first time you ever hatch it,
+	-- once, and completing an area's whole drop table hands you that area's bat.
+	-- He has 42 of the 84 and the 42 he is missing are worth 40,586,150 Speed
+	-- Power against the 11.5M he has - four times everything he owns, and the
+	-- only route past Prehistoric at 17M.
+	--
+	-- Which is why this is a panel and not a line: knowing you are one species
+	-- from the Desert Bat is worth more than any toggle on this tab.
+	indexPanel:Header({ Text = "Index" })
+
+	local indexTotal = indexPanel:Label({ Text = "Index · counting" })
+
+	local AREA_ORDER = {}
+	for id, area in pairs(AreaDirectory) do
+		if type(area) == "table" and type(area.DropTable) == "table" then
+			AREA_ORDER[#AREA_ORDER + 1] = {
+				id = id,
+				tier = tonumber(area.Rarity and area.Rarity.RarityNumber) or 0,
+			}
+		end
+	end
+	table.sort(AREA_ORDER, function(a, b)
+		return a.tier < b.tier
+	end)
+
+	local indexRows = {}
+	for _, area in ipairs(AREA_ORDER) do
+		indexRows[area.id] = indexPanel:Label({ Text = area.id .. " · counting" })
+	end
+
+	indexPanel:Button({
+		Name = "Claim Everything",
+		Callback = function()
+			task.spawn(function()
+				ask(NET.Index.REQUEST_CLAIM_ALL)
+				task.wait(0.6)
+				ask(NET.Index.REQUEST_CLAIM_LIMITED_EGG_REWARD)
+				core:Notify("Meridian", "Asked for every index reward", 4)
+			end)
+		end,
+	})
+
+	indexPanel:Toggle({
+		Name = "Equip Best Bat",
+		Default = true,
+		Callback = function(state)
+			F.indexBat = state
+		end,
+	}, "indexBat")
+
+	core:Loop("index", 6, function()
+		local progress = indexProgress()
+		local got, total, owed = 0, 0, 0
+		local closest, closestLeft = nil, math.huge
+
+		for _, area in ipairs(AREA_ORDER) do
+			local row = progress[area.id]
+			local label = indexRows[area.id]
+			if row and label then
+				got = got + row.got
+				total = total + row.total
+				owed = owed + row.owed
+				local left = row.total - row.got
+				if left > 0 and left < closestLeft then
+					closest, closestLeft = area.id, left
+				end
+				local text
+				if left == 0 then
+					text = ("%s · done · %s"):format(area.id, tostring(row.bat))
+				elseif left <= 3 then
+					text = ("%s · %d of %d · needs %s"):format(
+						area.id, row.got, row.total, table.concat(row.missing, ", "))
+				else
+					text = ("%s · %d of %d · %s Speed left here"):format(
+						area.id, row.got, row.total, short(row.owed))
+				end
+				label:UpdateName(text)
+			end
+		end
+
+		local headline
+		if closest then
+			headline = ("Index · %d of %d · %s Speed on the table · closest is %s, %d to go"):format(
+				got, total, short(owed), closest, closestLeft)
+		else
+			headline = ("Index · %d of %d · every area done"):format(got, total)
+		end
+		indexTotal:UpdateName(headline)
+
+		-- The bat from the best area you have finished. Nothing to do until one
+		-- of them is finished, which is the whole point of the panel above.
+		if F.indexBat ~= false and due("bat", 45) then
+			local best = nil
+			for _, area in ipairs(AREA_ORDER) do
+				local row = progress[area.id]
+				if row and row.got >= row.total then
+					best = area.id
+				end
+			end
+			if best then
+				if ask(NET.Index.REQUEST_EQUIP_AREA_BAT, best) then
+					accepted("bat")
+				else
+					refused("bat", 45)
+				end
+			end
+		end
+	end)
+
 	------------------------------------------------------------- visuals · left
 
 	visualsLeft:Header({ Text = "Eggs" })
@@ -2768,6 +3184,103 @@ function Module.Build(ctx)
 			F.eggEspRange = value
 		end,
 	}, "eggEspRange")
+
+	visualsLeft:Divider()
+
+	visualsLeft:Dropdown({
+		Name = "Colour By",
+		Multi = false,
+		Required = true,
+		Options = { "Worth", "Rarity", "Index" },
+		Default = 1,
+		Callback = function(value)
+			F.eggEspColour = value
+		end,
+	}, "eggEspColour")
+
+	visualsLeft:Toggle({
+		Name = "Mark New Species",
+		Default = true,
+		Callback = function(state)
+			F.eggEspNewTag = state
+		end,
+	}, "eggEspNewTag")
+
+	visualsLeft:Toggle({
+		Name = "Show Index Reward",
+		Default = true,
+		Callback = function(state)
+			F.eggEspReward = state
+		end,
+	}, "eggEspReward")
+
+	visualsLeft:Toggle({
+		Name = "Only New Species",
+		Default = false,
+		Callback = function(state)
+			F.eggEspOnlyNew = state
+		end,
+	}, "eggEspOnlyNew")
+
+	visualsLeft:Toggle({
+		Name = "Show Rarity",
+		Default = false,
+		Callback = function(state)
+			F.eggEspRarity = state
+		end,
+	}, "eggEspRarity")
+
+	visualsLeft:Toggle({
+		Name = "Show Area",
+		Default = false,
+		Callback = function(state)
+			F.eggEspArea = state
+		end,
+	}, "eggEspArea")
+
+	visualsLeft:Toggle({
+		Name = "Tracers",
+		Default = false,
+		Callback = function(state)
+			F.eggEspTracers = state
+		end,
+	}, "eggEspTracers")
+
+	visualsLeft:Slider({
+		Name = "How Many At Once",
+		Default = 60,
+		Minimum = 1,
+		Maximum = 60,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.eggEspMax = value
+		end,
+	}, "eggEspMax")
+
+	visualsLeft:Slider({
+		Name = "Text Size",
+		Default = 15,
+		Minimum = 10,
+		Maximum = 30,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.eggEspSize = value
+		end,
+	}, "eggEspSize")
+
+	visualsLeft:Slider({
+		Name = "Fill",
+		Default = 15,
+		Minimum = 0,
+		Maximum = 100,
+		DisplayMethod = "Percent",
+		Precision = 0,
+		Callback = function(value)
+			F.eggEspFill = value
+		end,
+	}, "eggEspFill")
 
 	------------------------------------------------------------ visuals · right
 
