@@ -232,6 +232,66 @@ function worth.nextBase(data)
 	}
 end
 
+-- Three ladders, one wallet, and until now no order between them.
+--
+-- Watched live: the account reached 2.8 billion, Auto Upgrade Treadmill took
+-- 2.6 of it for the next treadmill, and the base upgrade sitting there at one
+-- billion did not happen - not because it lost an argument, but because
+-- nothing was having one. Whichever timer came round first spent everything.
+--
+-- Cheapest first. Buying the cheap one does not stop the expensive one, since
+-- the money keeps arriving; buying the expensive one starves the cheap one for
+-- hours. So each buyer asks whether it is the cheapest thing currently
+-- affordable before it spends anything, and a trail already owned is free to
+-- put on whatever else is going on.
+function worth.shop(data)
+	local bits = worth.bits
+	if not bits or type(data) ~= "table" then
+		return nil
+	end
+	local money = tonumber(data.Money) or 0
+	local best = nil
+	local function offer(kind, cost, id, label)
+		cost = tonumber(cost)
+		if cost and cost <= money and (not best or cost < best.cost) then
+			best = { kind = kind, cost = cost, id = id, label = label }
+		end
+	end
+
+	local step = worth.nextBase(data)
+	if step and step.afford then
+		offer("base", step.cost, nil, ("Base %d"):format(step.level))
+	end
+
+	local level = tonumber(data.TreadmillUpgradeLevel)
+	if level and type(bits.Treadmills.GetByUpgradeLevel) == "function" then
+		local ok, up = pcall(bits.Treadmills.GetByUpgradeLevel, level + 1)
+		if ok and type(up) == "table" and up._id then
+			offer("treadmill", up.Price, up._id, tostring(up.DisplayName or up._id))
+		end
+	end
+
+	-- The next multiplier up, not the best in the shop: a trail four days of
+	-- saving away is not a thing to hold every other purchase for.
+	local have = 0
+	local wearing = data.EquippedTrail
+	if wearing and type(bits.Trails[wearing]) == "table" then
+		have = tonumber(bits.Trails[wearing].SpeedMultiplier) or 0
+	end
+	local pick, pickMulti = nil, math.huge
+	for id, cfg in pairs(bits.Trails) do
+		local multi = type(cfg) == "table" and tonumber(cfg.SpeedMultiplier) or nil
+		if multi and tonumber(cfg.Price) and multi > have and multi < pickMulti then
+			pick, pickMulti = id, multi
+		end
+	end
+	if pick then
+		offer("trail", bits.Trails[pick].Price, pick, tostring(bits.Trails[pick].DisplayName or pick))
+	end
+
+	return best
+end
+
 function Module.Build(ctx)
 	journal.entries = {}
 	local core, tabGroup = ctx.core, ctx.TabGroup
@@ -632,6 +692,11 @@ function Module.Build(ctx)
 	worth.wire({
 		AssetGen = AssetGen,
 		Bases = require(Directory:WaitForChild("Bases")),
+		Treadmills = require(Directory:WaitForChild("Treadmills")),
+		Trails = (function()
+			local list = require(Directory:WaitForChild("Trails"))
+			return list.Directory or list
+		end)(),
 	})
 
 	-- Which areas to farm, in order, best first.
@@ -721,7 +786,21 @@ function Module.Build(ctx)
 	-- and more honest than knowing every price in the game, and it means a farm
 	-- that cannot afford the next treadmill asks about it once and then not
 	-- again until it has actually earned something.
+	-- Read off the save, not off leaderstats.
+	--
+	-- This game has a leaderstats folder and there is no Money in it, so the
+	-- first version of this returned zero every single time. That is not a
+	-- cosmetic wrong number: due() refuses any buying key while money is at or
+	-- below what it was when the key last said no, so a recorded zero and a
+	-- returned zero meant "no more money than last time" forever. Auto Upgrade
+	-- Base locked itself out on its first tick and never asked again, and Auto
+	-- Skip Growth, Auto Buy Trail and Auto Upgrade Treadmill each died on their
+	-- first refusal. Four features, all of them looking fine in the code.
 	local function money()
+		local ok, data = pcall(Save.Get)
+		if ok and type(data) == "table" and tonumber(data.Money) then
+			return tonumber(data.Money)
+		end
 		local stats = LocalPlayer:FindFirstChild("leaderstats")
 		local cash = stats and stats:FindFirstChild("Money")
 		return tonumber(cash and cash.Value) or 0
@@ -3168,15 +3247,31 @@ function Module.Build(ctx)
 		-- asked for it forever, which is the shape of request that has removed
 		-- this account before. The ladder is a public table; there is nothing to
 		-- ask.
-		if F.baseUpgrade and due("upgrade", 30) then
-			local step = worth.nextBase(select(2, pcall(Save.Get)))
-			if step and step.afford then
+		-- Decide first, then ask for a slot.
+		--
+		-- due() consumes a shared 0.45 second gap across every key, and it did
+		-- so before this had worked out whether there was anything to buy. In
+		-- one synchronous pass hatch is checked, then skip, then this - so the
+		-- two above it took the gap every time and the upgrade never got a
+		-- turn. Watched live for nine minutes with two billion in the bank and
+		-- a one billion upgrade waiting: nothing.
+		--
+		-- Working out what is affordable costs nothing and touches no remote,
+		-- so it goes first. The gap is then only asked for when a purchase is
+		-- genuinely about to happen, which is a few times an evening.
+		if F.baseUpgrade then
+			local saved = select(2, pcall(Save.Get))
+			local step = worth.nextBase(saved)
+			local first = worth.shop(saved)
+			if step and step.afford and first and first.kind == "base"
+				and due("upgrade", 30)
+			then
 				ask(NET.Plots.REQUEST_BASE_UPGRADE)
 				journal.note(("BaseUpgrade %d for %d"):format(step.level, step.cost))
 				core:Notify("Meridian", ("Base %d · %s pets out at once"):format(
 					step.level, step.slots), 5)
+				spent("upgrade", 30)
 			end
-			spent("upgrade", 30)
 		end
 	end)
 
@@ -3226,7 +3321,7 @@ function Module.Build(ctx)
 		-- the answer to "no" is to wait, and asking anyway every twenty seconds
 		-- for the hours it takes to save three billion is the exact habit that
 		-- gets accounts removed.
-		if F.speedUpgrade and due("treadmill", 20) then
+		if F.speedUpgrade then
 			local shop = require(ReplicatedStorage.Directory.Treadmills)
 			local saved = select(2, pcall(Save.Get))
 			local level = type(saved) == "table" and tonumber(saved.TreadmillUpgradeLevel) or nil
@@ -3234,9 +3329,12 @@ function Module.Build(ctx)
 			if level and type(shop.GetByUpgradeLevel) == "function" then
 				okNext, next = pcall(shop.GetByUpgradeLevel, level + 1)
 			end
+			local first = worth.shop(saved)
 			if okNext and type(next) == "table" and next._id then
 				local price = tonumber(next.Price) or math.huge
-				if (saved.Money or 0) >= price then
+				if (saved.Money or 0) >= price and first and first.kind == "treadmill"
+					and due("treadmill", 20)
+				then
 					if ask(NET.Treadmills.REQUEST_UPGRADE, next._id) then
 						accepted("treadmill")
 						core:Notify("Meridian", ("Bought the %s"):format(tostring(next._id)), 5)
@@ -3250,7 +3348,7 @@ function Module.Build(ctx)
 		-- The trail multiplies the Speed step on top of the treadmill, so it is
 		-- the other half of the same sum and nothing was buying it either.
 		-- Red is 4x, Galaxy 5x, Secret 7x, Eternal 10x, Divine 14x.
-		if F.speedTrail and due("trail", 30) then
+		if F.speedTrail then
 			local shop = require(ReplicatedStorage.Directory.Trails)
 			local saved = select(2, pcall(Save.Get))
 			if type(saved) == "table" then
@@ -3269,9 +3367,15 @@ function Module.Build(ctx)
 						want, wantMulti = id, multi
 					end
 				end
-				if want then
+				if want and due("trail", 30) then
 					local got = owned[want] == true
 					if not got then
+						-- Wearing one you already own costs nothing and can
+						-- happen any time. Buying one waits its turn.
+						local first = worth.shop(saved)
+						if not (first and first.kind == "trail") then
+							return
+						end
 						got = ask(NET.Trails.REQUEST_PURCHASE, want)
 					end
 					if got and ask(NET.Trails.REQUEST_SELECT, want) then
