@@ -452,6 +452,11 @@ function Module.Build(ctx)
 		end
 	end
 
+	-- Not a constant, a starting guess. The server sends the real number with
+	-- every carry as SpeedMultiplier and the handler below overwrites this with
+	-- it, because guessing here is how you take an egg you cannot get away with:
+	-- at 62 walkspeed against a Desert guard that also walks 62, the difference
+	-- between 0.9 and whatever it really is decides the whole trip.
 	local CARRY_SLOWDOWN = 0.9
 	-- Arrive with room to spare rather than by a stride. A photo finish is a
 	-- lost egg most of the time, because the guard does not run in a straight
@@ -892,15 +897,23 @@ function Module.Build(ctx)
 					return
 				end
 				local was = carrying.active
+				local endedUid = carrying.uid
 				carrying.active = state.IsCarrying == true
 				carrying.uid = carrying.active and state.Uid or nil
 				carrying.slowedTo = tonumber(state.SpeedMultiplier) or 1
+
+				-- The server's own number for how much an egg slows you. Only
+				-- while actually carrying: it comes back as 1 when the carry
+				-- ends and that would quietly undo the measurement.
+				if carrying.active and carrying.slowedTo > 0 and carrying.slowedTo < 1 then
+					CARRY_SLOWDOWN = carrying.slowedTo
+				end
 
 				-- Carrying stopped. Either it was claimed, which is a Tool
 				-- appearing a moment later, or a guard took it off us. Give the
 				-- claim a moment to show up before calling it a loss.
 				if was and not carrying.active and onCarryEnded then
-					onCarryEnded()
+					onCarryEnded(endedUid)
 				end
 			end)
 		end
@@ -1226,14 +1239,36 @@ function Module.Build(ctx)
 
 	-- Now that there is a Tool to look for, the carry-ended signal above can
 	-- tell a claim from a guard taking it off us.
-	onCarryEnded = function()
+	onCarryEnded = function(uid)
 		task.delay(1.2, function()
 			local root = core:Root()
 			local home = root and PlotCmds.IsWorldPositionWithinLocalPlotBounds(root.Position)
-			if not home and not heldEggTool() then
-				stats.lost = (stats.lost or 0) + 1
-				noteLoss()
+			if home or heldEggTool() then
+				return
 			end
+			stats.lost = (stats.lost or 0) + 1
+
+			-- Why, not just that. The game records a DropReason on the egg and
+			-- they are not the same problem: GuardHit says the escape check was
+			-- wrong and trying again soon is how the account got kicked, while
+			-- PlayerSlap is another player on a busy server and no amount of
+			-- waiting fixes it. Counting them together sends the farm to the
+			-- treadmill for four minutes over something it could not have
+			-- avoided and could not have prevented by stopping.
+			local reason = "unknown"
+			if uid and EggCmds.GetAreaEggRecord then
+				local ok, record = pcall(EggCmds.GetAreaEggRecord, uid)
+				if ok and type(record) == "table" and record.DropReason then
+					reason = tostring(record.DropReason)
+				end
+			end
+			journal.note("lost " .. reason)
+
+			if reason == "PlayerSlap" then
+				sayOnce("slapped", "Someone slapped it out of your hands", "Not the guards, so not backing off")
+				return
+			end
+			noteLoss()
 		end)
 	end
 
