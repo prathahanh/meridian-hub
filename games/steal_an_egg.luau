@@ -49,6 +49,7 @@ Module.Tips = {
 	["Auto Hatch"] = "Hatches every egg on your base the moment it is ready.",
 	["Equip Best After Hatching"] = "A new pet is the only thing that changes which pets should be out, so it checks then. Full pen means the worst one goes.",
 	["Auto Skip Growth"] = "Pays to skip the wait on eggs that are still growing. This spends money.",
+	["Skip If Longer Than"] = "Only pays to skip an egg with more than this left to grow. Growth runs from ten seconds to a full day here, and it is the day-long ones that hold your base hostage overnight.",
 	["Claim Offline Money"] = "Collects what your pets earned while you were away.",
 	["Auto Collect"] = "Keeps collecting the money piling up on your base.",
 	["Auto Upgrade Base"] = "Buys the next base upgrade whenever you can afford it.",
@@ -2832,11 +2833,30 @@ function Module.Build(ctx)
 		-- Skipping costs money and the server refuses when you cannot afford it,
 		-- so this is the one most likely to be refused over and over. One egg,
 		-- slowly, and the gate backs it off further every time it is turned down.
+		--
+		-- It used to skip anything that was not ready, which paid to hurry along
+		-- an egg with eight seconds left. Growth times in this game run from ten
+		-- seconds to a full day, and the whole point of skipping is the long
+		-- ones: a twenty-four hour egg planted at midnight holds its patch of
+		-- the base until tomorrow evening, and enough of those is a base with no
+		-- room, which is how a night ends. So it skips what is actually in the
+		-- way and lets the short ones cook.
 		if F.baseSkip and due("skip", 4) then
+			local floor = (tonumber(F.baseSkipOver) or 5) * 60
+			local now = workspace:GetServerTimeNow()
+			local saved = select(2, pcall(Save.Get))
+			local bank = type(saved) == "table" and saved.EggInventory or nil
 			for _, egg in ipairs(ownEggs()) do
 				local ready = EggCmds.IsLocalEggReady and select(2, pcall(EggCmds.IsLocalEggReady, egg.uid))
-				if ready ~= true then
+				local left = 0
+				local held = bank and bank[egg.uid]
+				local where = type(held) == "table" and held.Placement or nil
+				if type(where) == "table" then
+					left = (tonumber(where.PlacedAt) or 0) + (tonumber(where.GrowthDuration) or 0) - now
+				end
+				if ready ~= true and left > floor then
 					local ok, took = pcall(EggCmds.RequestSkipGrowth, egg.uid)
+					journal.note(("SkipGrowth %dm %s"):format(left / 60, took ~= false and "ok" or "refused"))
 					if ok and took ~= false then
 						accepted("skip")
 					else
@@ -3741,6 +3761,18 @@ function Module.Build(ctx)
 			F.baseSkip = state
 		end,
 	}, "baseSkip")
+
+	baseLeft:Slider({
+		Name = "Skip If Longer Than",
+		Default = 5,
+		Minimum = 0,
+		Maximum = 120,
+		Precision = 0,
+		Suffix = " min",
+		Callback = function(value)
+			F.baseSkipOver = value
+		end,
+	}, "baseSkipOver")
 
 	--------------------------------------------------------------- base · right
 
