@@ -1214,19 +1214,32 @@ function Module.Build(ctx)
 			-- worth more than a night of farming, and there is no second chance
 			-- at a first hatch. The biggest one on the map wins, wherever it is.
 			if home then
+				-- Both of the reasons to leave home now go through the odds.
+				--
+				-- They did not, and it showed: a first hatch is worth more than
+				-- a night of farming, so New Species First overrode everything
+				-- and sent the farm to Snow for Penguins and Polar Bears it had
+				-- never hatched. He walks 97 there against a guard that walks
+				-- 98. Four eggs, four losses, and the index entry never landed
+				-- because you only get it by carrying the thing home. A species
+				-- you cannot get out with is not an index entry, it is a
+				-- donation, and no amount of it being rare changes that.
+				local homeOdds = chosenArea and losses.odds(chosenArea) or 1
 				local away, awayReward = nil, 0
 				for _, area in ipairs(tiers) do
+					local odds = losses.odds(area.id)
 					for _, egg in ipairs(byArea[area.id] or {}) do
-						if egg.fresh and egg.reward > awayReward then
-							away, awayReward = area.id, egg.reward
+						if egg.fresh and odds >= 0.5 and egg.reward * odds > awayReward then
+							away, awayReward = area.id, egg.reward * odds
 						end
 					end
 					if area.id ~= chosenArea then
 						for _, egg in ipairs(byArea[area.id] or {}) do
-							if egg.worth > homeBest * ESCAPE_MULTIPLE then
+							if egg.worth * odds > homeBest * homeOdds * ESCAPE_MULTIPLE then
 								out = byArea[area.id]
 								chosenArea = area.id
 								homeBest = egg.worth
+								homeOdds = odds
 							end
 						end
 					end
