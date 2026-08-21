@@ -649,9 +649,9 @@ function Module.Build(ctx)
 	-- refused. That is the exact shape this game kicks for, delivered slowly. So
 	-- past a dozen refusals in a row it stops asking at all for ten minutes, and
 	-- the next thing that succeeds clears the count.
-	local GIVE_UP_AFTER = 12
-	local GIVE_UP_FOR = 600
-	local parked = {}
+	-- On the parked table rather than beside it: Build is at Luau's 200 register
+	-- ceiling and four constants is four features that will not fit.
+	local parked = { AFTER = 12, FOR = 600, BUY_AFTER = 3, BUY_WAIT = 300 }
 
 	-- Anything that costs money is a special case, and getting it wrong cost an
 	-- account ten minutes of bouncing between servers.
@@ -662,26 +662,24 @@ function Module.Build(ctx)
 	-- kicks for. Money does not arrive in twenty seconds. A refused purchase is
 	-- worth trying again in five minutes and not before, and three in a row is
 	-- enough to stop asking until something changes.
-	local BUYING_AFTER = 3
-	local BUYING_WAIT = 300
 
 	local function refused(key, interval)
 		local count = (failures[key] or 0) + 1
 		failures[key] = count
 		if BUYING[key] then
 			refusedAt[key] = money()
-			if count >= BUYING_AFTER then
-				nextDue[key] = os.clock() + GIVE_UP_FOR
+			if count >= parked.BUY_AFTER then
+				nextDue[key] = os.clock() + parked.FOR
 				if not parked[key] then
 					parked[key] = 1
 					warn(("[Meridian] cannot afford %s, leaving it alone for a while"):format(key))
 				end
 			else
-				nextDue[key] = os.clock() + BUYING_WAIT
+				nextDue[key] = os.clock() + parked.BUY_WAIT
 			end
 			return count
 		end
-		if count >= GIVE_UP_AFTER then
+		if count >= parked.AFTER then
 			-- Each park lasts twice as long as the last one.
 			--
 			-- A fixed ten minutes sounds patient and is not: over a night it is
@@ -698,7 +696,7 @@ function Module.Build(ctx)
 			-- accepted().
 			local rounds = (parked[key] or 0) + 1
 			parked[key] = rounds
-			nextDue[key] = os.clock() + math.min(GIVE_UP_FOR * (2 ^ (rounds - 1)), 14400)
+			nextDue[key] = os.clock() + math.min(parked.FOR * (2 ^ (rounds - 1)), 14400)
 			if rounds <= 2 then
 				warn(("[Meridian] %s has been refused %d times, leaving it alone for a while"):format(key, count))
 			end
@@ -3784,6 +3782,18 @@ function Module.Build(ctx)
 	local visualsTab = tabGroup:Tab({ Name = "Visuals", Image = "rbxassetid://10734898355" })
 	local playerTab = tabGroup:Tab({ Name = "Player", Image = "rbxassetid://10747373176" })
 
+	-- The Map tab, for the half of the audience that actually plays.
+	--
+	-- Everything else in here is a switch that does something for you. Somebody
+	-- sitting at the keyboard does not want that; they want to know what is on
+	-- the map worth running for, what rarity it is, how far, and whether it is
+	-- one they have never hatched. The ESP already writes that on the eggs
+	-- themselves, but you cannot see the whole map at once, and the thing worth
+	-- running for is usually behind you.
+	--
+	-- One table because Build is at the register ceiling.
+	local live = { rows = {}, needs = {}, seen = {}, started = os.clock() }
+
 	local stealLeft = stealTab:Section({ Side = "Left" })
 	local stealRight = stealTab:Section({ Side = "Right" })
 	local baseLeft = baseTab:Section({ Side = "Left" })
@@ -4230,6 +4240,144 @@ function Module.Build(ctx)
 			return
 		end
 		fuse.label:UpdateName(("3 %s · %.2f average"):format(tostring(batch.species), batch.mean))
+	end)
+
+	------------------------------------------------------------------ map tab
+
+	live.tab = tabGroup:Tab({ Name = "Map", Image = "rbxassetid://10723345348" })
+	live.left = live.tab:Section({ Side = "Left" })
+	live.right = live.tab:Section({ Side = "Right" })
+
+	live.left:Header({ Text = "Best On The Map" })
+	live.summary = live.left:Label({ Text = "Looking" })
+	for i = 1, 8 do
+		live.rows[i] = live.left:Label({ Text = "-" })
+	end
+
+	live.right:Header({ Text = "Tell Me About" })
+
+	live.right:Toggle({
+		Name = "Rare Spawns",
+		Default = true,
+		Callback = function(state)
+			F.alertRare = state
+		end,
+	}, "alertRare")
+
+	live.right:Dropdown({
+		Name = "At Least",
+		Multi = false,
+		Required = true,
+		Options = { "Rare", "Epic", "Legendary", "Mythic", "Cosmic", "Secret", "Eternal", "Divine" },
+		Default = 4,
+		Callback = function(value)
+			F.alertRarity = value
+		end,
+	}, "alertRarity")
+
+	live.right:Toggle({
+		Name = "Species I Have Never Hatched",
+		Default = true,
+		Callback = function(state)
+			F.alertFresh = state
+		end,
+	}, "alertFresh")
+
+	live.right:Divider()
+	live.right:Header({ Text = "The Index Still Needs" })
+	for i = 1, 6 do
+		live.needs[i] = live.right:Label({ Text = "-" })
+	end
+
+	-- Two seconds is fast enough to be useful and slow enough that reading the
+	-- map does not cost the farm anything. rankedEggs is cached at a quarter
+	-- second, so this is free either way.
+	core:Loop("map", 2, function()
+		local list = rankedEggs()
+		local shown = 0
+		local bestWorth = -1
+		for _, egg in ipairs(list) do
+			local category = egg.record and egg.record.AssetCategory
+			if egg.worth > bestWorth then
+				bestWorth = egg.worth
+			end
+			if shown < 8 then
+				shown = shown + 1
+				local tag = ""
+				if egg.fresh then
+					tag = " · NEW"
+				end
+				if egg.mutations and #egg.mutations > 0 then
+					tag = tag .. " · " .. table.concat(egg.mutations, "+")
+				end
+				live.rows[shown]:UpdateName(("%s · %s/s · %s · %s · %dm%s"):format(
+					eggName(egg.record),
+					short(egg.worth),
+					tostring(select(2, rarityOf(category)) or "?"),
+					tostring(egg.record and egg.record.AreaId or "?"),
+					math.floor(egg.distance),
+					tag))
+			end
+		end
+		for i = shown + 1, 8 do
+			live.rows[i]:UpdateName("-")
+		end
+		if shown == 0 then
+			live.summary:UpdateName("Nothing on the map right now")
+		else
+			live.summary:UpdateName(("%d out there · best is %s a second"):format(#list, short(bestWorth)))
+		end
+
+		-- What the index is missing, nearest to finished first, because that is
+		-- the one worth going out of your way for.
+		local rows = {}
+		for id, row in pairs(indexProgress()) do
+			local left = row.total - row.got
+			if left > 0 then
+				rows[#rows + 1] = { id = id, left = left, owed = row.owed, missing = row.missing }
+			end
+		end
+		table.sort(rows, function(a, b)
+			return a.left < b.left
+		end)
+		for i = 1, 6 do
+			local row = rows[i]
+			if row then
+				live.needs[i]:UpdateName(("%s · %d to go · %s Speed · %s"):format(
+					row.id, row.left, short(row.owed),
+					table.concat(row.missing, ", "):sub(1, 60)))
+			else
+				live.needs[i]:UpdateName("-")
+			end
+		end
+	end)
+
+	-- Shouting about a spawn, which is the one thing a person at the keyboard
+	-- cannot do for themselves: the map is bigger than the screen and the good
+	-- one is usually behind you.
+	core:Loop("alerts", 1.5, function()
+		if os.clock() - live.started < 12 then
+			return
+		end
+		local floor = selling.RANK[F.alertRarity or "Mythic"] or 6
+		for _, egg in ipairs(rankedEggs()) do
+			local uid = egg.record and egg.record.Uid
+			if uid and not live.seen[uid] then
+				live.seen[uid] = true
+				local category = egg.record.AssetCategory
+				local rank = selling.RANK[tostring(select(2, rarityOf(category)))] or 0
+				local worthShouting = (F.alertRare ~= false and rank >= floor)
+					or (F.alertFresh ~= false and egg.fresh)
+				if worthShouting then
+					core:Notify("Meridian", ("%s · %s/s · %s · %s · %dm"):format(
+						eggName(egg.record),
+						short(egg.worth),
+						egg.fresh and "NEVER HATCHED" or tostring(select(2, rarityOf(category))),
+						tostring(egg.record.AreaId),
+						math.floor(egg.distance)), 8)
+				end
+			end
+		end
 	end)
 
 	------------------------------------------------------------ progress · left
@@ -4709,6 +4857,7 @@ function Module.Build(ctx)
 			Progress = progressTab,
 			Visuals = visualsTab,
 			Player = playerTab,
+			Map = live.tab,
 		},
 		Default = stealTab,
 		Tips = Module.Tips,
