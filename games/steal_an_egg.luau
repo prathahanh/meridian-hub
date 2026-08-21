@@ -54,8 +54,9 @@ Module.Tips = {
 	["Auto Upgrade Base"] = "Buys the next base upgrade whenever you can afford it.",
 	["Auto Equip Best"] = "Keeps your best pets out, as the game ranks them.",
 	["Equip Best Now"] = "Does it once, right now.",
-	["Auto Sell"] = "Turns on the game's own auto sell, so junk never fills your inventory.",
+	["Auto Sell"] = "Sells pets as they hatch, up to the rarity you pick. Favourites are never sold. Leave this on overnight or the pen fills, hatching stops, and the farm has nowhere to plant.",
 	["Sell Everything"] = "Sells your whole inventory except favourites. There is no undo.",
+	["Sell Up To"] = "Everything at this rarity and below gets sold. Uncommon keeps anything Rare or better.",
 	["Auto Fuse Runts"] = "Fuses three of the same species when they are small enough that it pays. Three pets become one egg, so it only wins on runts: at ordinary size you get back well under half of what you put in.",
 	["Only Fuse Below"] = "The size a pet has to be under before it is worth fusing. 0.66 is where the maths turns; above it you lose earnings every time.",
 	["Auto Treadmill"] = "Stands on the treadmill and keeps earning Speed while you are not doing anything else.",
@@ -86,7 +87,7 @@ Module.Tips = {
 	["Hide Cheap Eggs"] = "Only draws eggs worth more than your filter, so the screen is not full of Dogs.",
 	["Max Distance"] = "Stops drawing eggs past this far away.",
 	["Player ESP"] = "Draws every other player through walls.",
-	["Anti AFK"] = "Stops the game kicking you for standing still.",
+	["Anti AFK"] = "Stops Roblox idling you out, and stops the game bouncing you out and back every eighteen minutes. Turn it off and you get the normal AFK behaviour, which is worth trying if a night keeps ending early.",
 	["Auto Hop"] = "Leaves for a better server once this one has emptied out.",
 	["Hop When Below"] = "How few people have to be left before it goes looking for somewhere else.",
 	["Pick Server By"] = "What makes a server worth moving to.",
@@ -846,7 +847,14 @@ function Module.Build(ctx)
 	-- farm never went for another egg; filtering those out left it recognising
 	-- nothing at all, so it never went home either and just kept hunting with an
 	-- egg in its hands. Both symptoms, one wrong question.
-	local carrying = { active = false, uid = nil, slowedTo = 1 }
+	local selling = {
+		RANK = {
+			Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5,
+			Mythic = 6, Cosmic = 7, Secret = 8, Eternal = 9, Divine = 10,
+		},
+	}
+
+	local carrying = { active = false, uid = nil, slowedTo = 1, area = nil }
 
 	-- Losing an egg is the observable that matters, and until now nothing
 	-- counted it.
@@ -861,7 +869,61 @@ function Module.Build(ctx)
 	-- The three numbers live on the table rather than beside it, because Build
 	-- is at Luau's 200-register ceiling and three constants is three registers
 	-- that a whole feature needed more. See MERIDIAN-DESIGN.
-	local losses = { at = {}, cooling = 0, window = 300, limit = 3, cooldown = 240 }
+	local losses = { at = {}, cooling = 0, window = 300, limit = 3, cooldown = 240, byArea = {} }
+
+	-- How often a trip out of an area actually ends with the egg at home.
+	losses.seen = function(areaId, gotHome)
+		if type(areaId) ~= "string" then
+			return
+		end
+		local row = losses.byArea[areaId]
+		if not row then
+			row = { home = 0, lost = 0 }
+			losses.byArea[areaId] = row
+		end
+		if gotHome then
+			row.home = row.home + 1
+		else
+			row.lost = row.lost + 1
+		end
+	end
+
+	-- The odds of getting an egg out of an area, as a number between 0 and 1.
+	--
+	-- The sign at the mouth of an area says what Speed gets you in. It says
+	-- nothing about what gets you out, and those are different questions: at 62
+	-- walkspeed against a Desert guard that also walks 62 he lost three in a
+	-- row, twice, out of an area the sign said he was ready for. A rich area you
+	-- cannot leave is worth nothing at all.
+	--
+	-- Two sources. The prior is physics - your carrying speed against the
+	-- guard's, which is knowable before you ever go there and is what stops the
+	-- farm learning the hard way in an area that will hurt. The correction is
+	-- what actually happened, because the prior knows nothing about the shape of
+	-- the room, where the door is, or how many players are on the server
+	-- slapping eggs out of your hands. Observation takes over as trips
+	-- accumulate, and never entirely, so a run of bad luck cannot write an area
+	-- off forever.
+	losses.odds = function(areaId)
+		local config = GuardConfig[areaId]
+		local guard = tonumber(type(config) == "table" and config.WalkSpeed) or 60
+		local hum = core:Humanoid()
+		local mine = (hum and hum.WalkSpeed or 16) * CARRY_SLOWDOWN
+		local ratio = mine / math.max(guard, 1)
+		-- Level pegging is a coin toss; 15% either way settles it.
+		local prior = math.clamp((ratio - 0.85) / 0.3, 0.05, 1)
+
+		local row = losses.byArea[areaId]
+		if not row then
+			return prior
+		end
+		local trips = row.home + row.lost
+		if trips < 3 then
+			return prior
+		end
+		local weight = math.min(trips / 10, 0.8)
+		return prior * (1 - weight) + (row.home / trips) * weight
+	end
 
 	-- Filled in further down, once there is something to ask about a Tool and
 	-- somewhere to count it. The signal has to be connected here, before the
@@ -898,6 +960,7 @@ function Module.Build(ctx)
 				end
 				local was = carrying.active
 				local endedUid = carrying.uid
+				local endedArea = carrying.area
 				carrying.active = state.IsCarrying == true
 				carrying.uid = carrying.active and state.Uid or nil
 				carrying.slowedTo = tonumber(state.SpeedMultiplier) or 1
@@ -913,7 +976,7 @@ function Module.Build(ctx)
 				-- appearing a moment later, or a guard took it off us. Give the
 				-- claim a moment to show up before calling it a loss.
 				if was and not carrying.active and onCarryEnded then
-					onCarryEnded(endedUid)
+					onCarryEnded(endedUid, endedArea)
 				end
 			end)
 		end
@@ -1021,17 +1084,29 @@ function Module.Build(ctx)
 		else
 			local tiers = areasByTier()
 			local home, homeBest = nil, 0
+
+			-- Worth times the odds of getting it home, not the highest sign.
+			-- The old rule took the richest area it was allowed into and stayed
+			-- there, which is how it spent an afternoon feeding Desert guards.
+			-- An area where nothing survives the walk scores zero however good
+			-- the eggs look sitting on the ground.
+			local bestScore = 0
 			for _, area in ipairs(tiers) do
 				local bucket = byArea[area.id]
 				if bucket and #bucket > 0 then
-					home = bucket
-					chosenArea = area.id
+					local top = 0
 					for _, egg in ipairs(bucket) do
-						if egg.worth > homeBest then
-							homeBest = egg.worth
+						if egg.worth > top then
+							top = egg.worth
 						end
 					end
-					break
+					local score = top * losses.odds(area.id)
+					if score > bestScore then
+						bestScore = score
+						home = bucket
+						homeBest = top
+						chosenArea = area.id
+					end
 				end
 			end
 			out = home or {}
@@ -1239,11 +1314,12 @@ function Module.Build(ctx)
 
 	-- Now that there is a Tool to look for, the carry-ended signal above can
 	-- tell a claim from a guard taking it off us.
-	onCarryEnded = function(uid)
+	onCarryEnded = function(uid, area)
 		task.delay(1.2, function()
 			local root = core:Root()
 			local home = root and PlotCmds.IsWorldPositionWithinLocalPlotBounds(root.Position)
 			if home or heldEggTool() then
+				losses.seen(area, true)
 				return
 			end
 			stats.lost = (stats.lost or 0) + 1
@@ -1263,6 +1339,8 @@ function Module.Build(ctx)
 				end
 			end
 			journal.note("lost " .. reason)
+
+			losses.seen(area, false)
 
 			if reason == "PlayerSlap" then
 				sayOnce("slapped", "Someone slapped it out of your hands", "Not the guards, so not backing off")
@@ -2414,6 +2492,30 @@ function Module.Build(ctx)
 		-- the egg still in its hands. Which is exactly what he watched happen.
 		local eggUid, eggTool = heldEggTool()
 		local bagged = eggUid and 0 or #looseEggs()
+
+		-- A base with no room is the one refusal that does not go away on its
+		-- own, and until now it ended the night. Six attempts, a line in the
+		-- notifications nobody is awake to read, and then the farm stood at the
+		-- pad holding an egg and retrying forever: no eggs, no Speed, no money
+		-- until morning. Ten minutes on the treadmill is worth something, and
+		-- the parking expires by itself, so it goes back and tries again.
+		if (eggUid or bagged > 0) and parked["place"] and os.clock() < (nextDue["place"] or 0) then
+			local spot = treadmillSpot()
+			if spot then
+				if not grinding then
+					grinding = true
+					currentTarget = nil
+					core:Notify("Meridian", "Base is full. Earning Speed until there is room.", 6)
+				end
+				grindReason = "base is full, nowhere to plant"
+				if walkTo(spot, 3) then
+					stopWalking()
+				end
+				treadmill.mount()
+				return
+			end
+		end
+
 		if eggUid or bagged > 0 then
 			currentTarget = nil
 			if F.basePlace == false then
@@ -2615,6 +2717,11 @@ function Module.Build(ctx)
 		-- is why the farm reported nothing and stood still.
 		local took, reason = answerWithin(EggCmds.RequestCarryAreaEgg, currentTarget.record.Uid)
 		journal.note(("CarryAreaEgg %s %s"):format(tostring(chosenArea), took and "ok" or ("refused: " .. tostring(reason))))
+		if took then
+			-- Tagged here rather than in the carry-state handler, which is built
+			-- before chosenArea exists and would have read a nil global.
+			carrying.area = chosenArea
+		end
 		local ok = true
 		if took then
 			accepted("carry")
@@ -3280,16 +3387,44 @@ function Module.Build(ctx)
 		end,
 	})
 
-	-- Anti AFK. Disabling the Idled connections is quieter than pretending to
-	-- click: VirtualUser is a CoreScript API, so a normal script calling it is
-	-- a loud thing to be doing every twenty minutes all night.
-	task.spawn(function()
-		local ok = pcall(function()
+	-- Anti AFK, and it now does what the switch says.
+	--
+	-- Disabling the Idled connections is quieter than pretending to click:
+	-- VirtualUser is a CoreScript API and a normal script reaching for it every
+	-- twenty minutes all night is a loud thing to be doing. But the disable ran
+	-- at load and ignored the flag entirely, so the toggle controlled nothing.
+	--
+	-- What it switches off matters more than it looks. The game's own AntiAFK
+	-- hangs off the same signal: sixty seconds idle and it reports you AFK to
+	-- the server, eighteen minutes and it calls
+	-- `TeleportService:Teleport(game.PlaceId)` to bounce you out and back.
+	-- Killing every Idled connection stops the bounce, which is the difference
+	-- between one long night and twenty-six rejoins, but it also stops the AFK
+	-- report the server would otherwise get from an unattended player.
+	--
+	-- Two kicks so far have landed with the hub loaded and every switch off, and
+	-- this ran anyway, so it is one of the very few things that was true both
+	-- times. Now it obeys the flag, which makes the overnight run an experiment
+	-- that can be run twice instead of a single guess.
+	core.SetAntiAfk = function(on)
+		return pcall(function()
 			for _, connection in ipairs(getconnections(LocalPlayer.Idled)) do
-				connection:Disable()
+				if on then
+					connection:Disable()
+				else
+					connection:Enable()
+				end
 			end
 		end)
+	end
+
+	task.spawn(function()
+		if F.antiAfk == false then
+			return
+		end
+		local ok = core.SetAntiAfk(true)
 		if not ok then
+			-- No getconnections, so fall back to looking like a keypress.
 			core:Connect(LocalPlayer.Idled, function()
 				if F.antiAfk == false then
 					return
@@ -3650,6 +3785,29 @@ function Module.Build(ctx)
 
 	petsRight:Header({ Text = "Selling" })
 
+	-- Auto Sell has never sold anything, and this is why: SetAutoSellState does
+	-- not take a boolean, it takes a map of rarity name to true, and the hub was
+	-- sending it `true`. The server took the call, found nothing it recognised,
+	-- and set nothing. Ten rarities, Common through Divine, numbered 1 to 10.
+	--
+	-- It matters more than it looks. A night unattended fills the pen, a full
+	-- pen stops eggs hatching, and eggs that cannot hatch stop the plot ever
+	-- having room, which stops planting, which strands the farm at the pad
+	-- holding an egg it cannot put down. Selling the bottom of the ladder is
+	-- what keeps a night moving.
+	selling.push = function()
+		local map = {}
+		if F.petsAutoSell then
+			local limit = selling.RANK[F.petsSellUpTo or "Uncommon"] or 2
+			for name, rank in pairs(selling.RANK) do
+				if rank <= limit then
+					map[name] = true
+				end
+			end
+		end
+		ask(NET.Backpack.SET_AUTO_SELL_STATE, map)
+	end
+
 	petsRight:Toggle({
 		Name = "Auto Sell",
 		Default = false,
@@ -3658,11 +3816,21 @@ function Module.Build(ctx)
 			-- Spawned, like every other call out of a control. Network.Invoke is a
 			-- round trip, and a callback that yields blocks the interface thread that
 			-- called it.
-			task.spawn(function()
-				ask(NET.Backpack.SET_AUTO_SELL_STATE, state)
-			end)
+			task.spawn(selling.push)
 		end,
 	}, "petsAutoSell")
+
+	petsRight:Dropdown({
+		Name = "Sell Up To",
+		Multi = false,
+		Required = true,
+		Options = { "Common", "Uncommon", "Rare", "Epic", "Legendary", "Mythic" },
+		Default = 2,
+		Callback = function(value)
+			F.petsSellUpTo = value
+			task.spawn(selling.push)
+		end,
+	}, "petsSellUpTo")
 
 	petsRight:Button({
 		Name = "Sell Everything",
@@ -4097,6 +4265,11 @@ function Module.Build(ctx)
 		Default = true,
 		Callback = function(state)
 			F.antiAfk = state
+			task.spawn(function()
+				if type(core.SetAntiAfk) == "function" then
+					core.SetAntiAfk(state)
+				end
+			end)
 		end,
 	}, "antiAfk")
 
