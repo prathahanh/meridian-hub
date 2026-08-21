@@ -56,6 +56,8 @@ Module.Tips = {
 	["Equip Best Now"] = "Does it once, right now.",
 	["Auto Sell"] = "Turns on the game's own auto sell, so junk never fills your inventory.",
 	["Sell Everything"] = "Sells your whole inventory except favourites. There is no undo.",
+	["Auto Fuse Runts"] = "Fuses three of the same species when they are small enough that it pays. Three pets become one egg, so it only wins on runts: at ordinary size you get back well under half of what you put in.",
+	["Only Fuse Below"] = "The size a pet has to be under before it is worth fusing. 0.66 is where the maths turns; above it you lose earnings every time.",
 	["Auto Treadmill"] = "Stands on the treadmill and keeps earning Speed while you are not doing anything else.",
 	["Auto Upgrade Treadmill"] = "Buys the next treadmill whenever you can afford it.",
 	["Treadmill When Eggs Are Poor"] = "When nothing on the map would move the needle, stands on the treadmill instead of walking fifteen hundred studs for an egg worth a rounding error.",
@@ -851,10 +853,10 @@ function Module.Build(ctx)
 	-- Three in five minutes means whatever the prediction thinks, it is losing,
 	-- so it goes home and earns Speed for a while instead. Which is both safer
 	-- and what a person would do after being caught three times.
-	local losses = { at = {}, cooling = 0 }
-	local LOSS_WINDOW = 300
-	local LOSS_LIMIT = 3
-	local LOSS_COOLDOWN = 240
+	-- The three numbers live on the table rather than beside it, because Build
+	-- is at Luau's 200-register ceiling and three constants is three registers
+	-- that a whole feature needed more. See MERIDIAN-DESIGN.
+	local losses = { at = {}, cooling = 0, window = 300, limit = 3, cooldown = 240 }
 
 	-- Filled in further down, once there is something to ask about a Tool and
 	-- somewhere to count it. The signal has to be connected here, before the
@@ -865,15 +867,15 @@ function Module.Build(ctx)
 		local now = os.clock()
 		local kept = {}
 		for _, when in ipairs(losses.at) do
-			if now - when < LOSS_WINDOW then
+			if now - when < losses.window then
 				kept[#kept + 1] = when
 			end
 		end
 		kept[#kept + 1] = now
 		losses.at = kept
-		if #kept >= LOSS_LIMIT then
+		if #kept >= losses.limit then
 			losses.at = {}
-			losses.cooling = now + LOSS_COOLDOWN
+			losses.cooling = now + losses.cooldown
 			core:Notify("Meridian", "Lost three in a row. Earning Speed for a bit instead.", 6)
 		end
 	end
@@ -1815,7 +1817,36 @@ function Module.Build(ctx)
 		if beingCareful() then
 			return true, "lost three, letting the guards settle", area, gap
 		end
-		if gap and gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE then
+		-- An area you can already walk into and have never finished is worth
+		-- more than the next door along.
+		--
+		-- On a fresh account the old rule ground forever. Ten Speed, no pets, no
+		-- money: it walked to the treadmill, unlocked Lake, did not so much as
+		-- glance at it, and set off for Desert eight thousand Speed away. Half
+		-- an hour in it would still have had nothing - no eggs, no income, an
+		-- empty index - because a gap that big divided by the treadmill's rate
+		-- still came in under half an hour of patience, and patience was the
+		-- only thing the rule asked about.
+		--
+		-- What it should have asked is whether there is anything left in the
+		-- room. Every species is an index entry, and an index entry is Speed you
+		-- keep and a bat, on top of the egg's own earnings. Grinding past a room
+		-- you have not emptied is buying a door you do not need yet.
+		--
+		-- The locals here are free: this is its own closure, and it is Build's
+		-- register frame that is full, not this one.
+		local unfinished = nil
+		if best then
+			local power = mySpeedPower()
+			for id, row in pairs(indexProgress()) do
+				local need = AREA_NEEDS[id]
+				if need and need <= power and row.got < row.total then
+					unfinished = id
+					break
+				end
+			end
+		end
+		if gap and not unfinished and gap / math.max(rate.estimate, 1) <= TREADMILL_PATIENCE then
 			return true, ("%s of Speed to %s"):format(short(gap), area), area, gap
 		end
 		if F.speedIdle ~= false then
@@ -1949,6 +1980,181 @@ function Module.Build(ctx)
 		local z = math.clamp(toward.Z, -half.Z * 0.6, half.Z * 0.6)
 		homeSpot = pad.CFrame:PointToWorldSpace(Vector3.new(x, 0, z))
 		return homeSpot
+	end
+
+	----------------------------------------------------------------------------
+	-- the fuse machine
+	----------------------------------------------------------------------------
+
+	-- Three pets of one species in, one egg of that species out, and a fee of
+	-- three minutes of what those three were earning. He said his pets got worse
+	-- and he was right: it is a losing trade nearly everywhere, and the reason is
+	-- a single exponent. A pet earns as scale^1.85, so turning three into one
+	-- needs the survivor 81% bigger than the inputs just to break even.
+	--
+	-- Rolling the game's own RollFusedAssetScale twenty thousand times per input
+	-- size: three ordinary pets hand back 58% of the earning power that went in,
+	-- and beat the trade one time in ten. It gets worse the better the pets are,
+	-- because the tilt toward bigger tiers never catches the s^1.85 you threw
+	-- away - three scale-4 pets keep a fifth. Worst of all, the fee reads the
+	-- inputs' mutations and triples for them while the output rolls its own, so
+	-- three mutated pets cost treble and come back plain.
+	--
+	-- There is exactly one place it wins. Below about 0.66 the roll drags a runt
+	-- back toward an ordinary pet, and three runts are worth so little that
+	-- nearly anything beats them. So this fuses runts and refuses everything
+	-- else. Every other hub will ship "Auto Fuse" and quietly cost people money
+	-- three pets at a time.
+	--
+	-- One table rather than a dozen locals, because Build is one function sitting
+	-- on Luau's ceiling of 200 registers and a whole feature will not fit.
+	local fuse = { crossover = 0.656, spot = nil, said = false }
+
+	function fuse.machine()
+		if fuse.spot then
+			return fuse.spot
+		end
+		local objects = Workspace:FindFirstChild("__OBJECTS")
+		local machines = objects and objects:FindFirstChild("Machines")
+		local model = machines and machines:FindFirstChild("FuseMachine")
+		local part = model and (model.PrimaryPart
+			or model:FindFirstChild("Overhead")
+			or model:FindFirstChildWhichIsA("BasePart"))
+		fuse.spot = part and part.Position or nil
+		return fuse.spot
+	end
+
+	-- Three of one species, all under the line, none favourited, none already in
+	-- a machine. Smallest first, and of the species that qualify, the one whose
+	-- three are smallest - that is where the roll has the most room to help.
+	function fuse.pick()
+		local limit = tonumber(F.petsFuseBelow) or fuse.crossover
+		local ok, data = pcall(Save.Get)
+		if not ok or type(data) ~= "table" or type(data.Inventory) ~= "table" then
+			return nil
+		end
+		local bySpecies = {}
+		for uid, item in pairs(data.Inventory) do
+			if type(uid) == "string" and type(item) == "table"
+				and item.IsFavorite ~= true and item.InFuse ~= true
+				and (tonumber(item.Scale) or 1) < limit
+			then
+				local list = bySpecies[item.Category]
+				if not list then
+					list = {}
+					bySpecies[item.Category] = list
+				end
+				list[#list + 1] = { uid = uid, scale = tonumber(item.Scale) or 1 }
+			end
+		end
+		local best, bestMean = nil, math.huge
+		for species, list in pairs(bySpecies) do
+			if #list >= 3 then
+				table.sort(list, function(a, b)
+					return a.scale < b.scale
+				end)
+				local mean = (list[1].scale + list[2].scale + list[3].scale) / 3
+				if mean < bestMean then
+					bestMean = mean
+					best = {
+						species = species,
+						uids = { list[1].uid, list[2].uid, list[3].uid },
+						mean = mean,
+					}
+				end
+			end
+		end
+		return best
+	end
+
+	-- How many are in the machine right now, and whether they are ours to touch.
+	function fuse.loaded(data)
+		local n = 0
+		for i = 1, 3 do
+			local uid = data.FusionSlots and data.FusionSlots[i]
+			if uid and data.Inventory and data.Inventory[uid] then
+				n = n + 1
+			end
+		end
+		return n
+	end
+
+	-- One step per call, never two, and every step behind a gate. The machine is
+	-- a RemoteFunction on every route and the one lesson this game has taught
+	-- repeatedly is that an impossible request asked twice a second is what gets
+	-- you removed.
+	function fuse.tick()
+		if F.petsFuse ~= true then
+			return false
+		end
+		local ok, data = pcall(Save.Get)
+		if not ok or type(data) ~= "table" then
+			return false
+		end
+
+		-- Something finished: take it before anything else.
+		if data.FusionReward ~= nil or data.FusionEggReward == true then
+			if due("fuseClaim", 5) and ask(NET.FuseMachine.COMPLETE_REVEAL) then
+				accepted("fuseClaim")
+				core:Notify("Meridian", "Took the fused egg", 4)
+			end
+			return true
+		end
+
+		-- Running. Nothing to do but let it.
+		if data.FusionLocked == true then
+			return true
+		end
+
+		local held = fuse.loaded(data)
+
+		-- Loaded and idle: start it.
+		if held >= 3 then
+			if not due("fuseStart", 6) then
+				return true
+			end
+			local started, why = ask(NET.FuseMachine.START_FUSE)
+			if started then
+				accepted("fuseStart")
+				core:Notify("Meridian", "Fusing three runts", 4)
+			elseif refused("fuseStart", 6) == 1 then
+				sayOnce("fuse", "Could not start the fuse", tostring(why or "the server said no"))
+			end
+			return true
+		end
+
+		local batch = fuse.pick()
+		if not batch then
+			return false
+		end
+
+		-- The machine is a fixed thing across the lobby and the requests may or
+		-- may not care how far away we are. Walking there is what a player does
+		-- and it costs one trip, where being wrong about it costs a refusal
+		-- repeated forever.
+		local where = fuse.machine()
+		if not where then
+			return false
+		end
+		if not walkTo(where, 12) then
+			return true
+		end
+		stopWalking()
+
+		if not due("fuseInsert", 1.5) then
+			return true
+		end
+		local uid = batch.uids[held + 1]
+		if not uid then
+			return true
+		end
+		local inserted, why = ask(NET.FuseMachine.INSERT_MOB, uid)
+		if inserted then
+			accepted("fuseInsert")
+		elseif refused("fuseInsert", 1.5) == 1 then
+			sayOnce("fuseIn", "Could not load the fuse machine", tostring(why or "the server said no"))
+		end
+		return true
 	end
 
 	local function goHome()
@@ -2240,6 +2446,15 @@ function Module.Build(ctx)
 		-- Hands empty, so the question is what the next hour is worth more spent
 		-- on. Almost always eggs. Occasionally the treadmill, when the next area
 		-- is one sitting away and a whole tier of egg is on the other side of it.
+		-- Clearing the runts out, before deciding between eggs and the treadmill.
+		-- It shares one pair of legs with the farm, so it cannot have a loop of
+		-- its own: two callers of walkTo pulling in different directions is the
+		-- farm leaning on a wall again. It runs here, where the hands are empty,
+		-- and it says whether it is busy.
+		if fuse.tick() then
+			return
+		end
+
 		if F.speedGrind ~= false then
 			local grind, why = worthGrinding(rankedEggs()[1])
 			if grind then
@@ -3422,6 +3637,41 @@ function Module.Build(ctx)
 			end)
 		end,
 	})
+
+	------------------------------------------------------------- pets · fusing
+
+	petsRight:Header({ Text = "Fusing" })
+
+	petsRight:Toggle({
+		Name = "Auto Fuse Runts",
+		Default = false,
+		Callback = function(state)
+			F.petsFuse = state
+		end,
+	}, "petsFuse")
+
+	petsRight:Slider({
+		Name = "Only Fuse Below",
+		Default = 0.65,
+		Minimum = 0.1,
+		Maximum = 1.5,
+		Precision = 2,
+		Callback = function(value)
+			F.petsFuseBelow = value
+		end,
+	}, "petsFuseBelow")
+
+	-- On the table, not a local: Build has no registers left. See MERIDIAN-DESIGN.
+	fuse.label = petsRight:Label({ Text = "Nothing worth fusing" })
+
+	core:Loop("fuseLabel", 5, function()
+		local batch = fuse.pick()
+		if not batch then
+			fuse.label:UpdateName("Nothing worth fusing")
+			return
+		end
+		fuse.label:UpdateName(("3 %s · %.2f average"):format(tostring(batch.species), batch.mean))
+	end)
 
 	------------------------------------------------------------ progress · left
 
