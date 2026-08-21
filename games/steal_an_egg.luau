@@ -671,7 +671,7 @@ function Module.Build(ctx)
 			if count >= BUYING_AFTER then
 				nextDue[key] = os.clock() + GIVE_UP_FOR
 				if not parked[key] then
-					parked[key] = true
+					parked[key] = 1
 					warn(("[Meridian] cannot afford %s, leaving it alone for a while"):format(key))
 				end
 			else
@@ -680,9 +680,24 @@ function Module.Build(ctx)
 			return count
 		end
 		if count >= GIVE_UP_AFTER then
-			nextDue[key] = os.clock() + GIVE_UP_FOR
-			if not parked[key] then
-				parked[key] = true
+			-- Each park lasts twice as long as the last one.
+			--
+			-- A fixed ten minutes sounds patient and is not: over a night it is
+			-- forty-eight more attempts at something that was never going to
+			-- work. The journal caught five of these running at once - a group
+			-- reward that fails a server assertion, an index claim with nothing
+			-- to claim, a limited egg that needs an index finished first, an
+			-- offline redeem erroring on a nil table - each one asked, refused,
+			-- and asked again all night. That is the exact shape that gets an
+			-- account removed, and it was happening with nothing else wrong.
+			--
+			-- Doubling turns three hundred impossible requests a night into
+			-- about thirty, and one success anywhere resets it through
+			-- accepted().
+			local rounds = (parked[key] or 0) + 1
+			parked[key] = rounds
+			nextDue[key] = os.clock() + math.min(GIVE_UP_FOR * (2 ^ (rounds - 1)), 14400)
+			if rounds <= 2 then
 				warn(("[Meridian] %s has been refused %d times, leaving it alone for a while"):format(key, count))
 			end
 			return count
@@ -848,6 +863,65 @@ function Module.Build(ctx)
 	-- farm never went for another egg; filtering those out left it recognising
 	-- nothing at all, so it never went home either and just kept hunting with an
 	-- egg in its hands. Both symptoms, one wrong question.
+	----------------------------------------------------------------------------
+	-- the night
+	----------------------------------------------------------------------------
+
+	-- The map runs on a five minute cycle and ten seconds of it are night.
+	--
+	-- At night the areas shut: a wall goes up, anyone inside is teleported out,
+	-- and every area egg resets and respawns somewhere else. So a farm that
+	-- keeps hunting through it walks at a wall, chases an egg that no longer
+	-- exists, and asks the server for eggs that have been deleted - which is the
+	-- same repeated-refusal shape that gets accounts removed.
+	--
+	-- It is also the one part of the cycle with something better to do. Night
+	-- pays a growth bonus of thirty times normal on everything planted, and the
+	-- treadmill and the upgrade queue do not care what time it is. Ten seconds
+	-- of Speed beats ten seconds of walking into a wall.
+	local cycle = { util = nil }
+
+	function cycle.reach()
+		if cycle.util == nil then
+			local ok, mod = pcall(require, ReplicatedStorage.Library.Util.AreaEggResetTimeUtil)
+			cycle.util = ok and mod or false
+		end
+		return cycle.util or nil
+	end
+
+	-- Night itself, and the transition either side of it.
+	function cycle.shut()
+		local util = cycle.reach()
+		if not util then
+			return false
+		end
+		local now = workspace:GetServerTimeNow()
+		local ok, night = pcall(util.IsNight, now)
+		if ok and night == true then
+			return true
+		end
+		local okTransition, moving = pcall(util.IsNightTransition, now)
+		return okTransition and moving == true
+	end
+
+	-- How long until they shut, so a trip that cannot finish is never started.
+	function cycle.untilShut()
+		local util = cycle.reach()
+		if not util then
+			return math.huge
+		end
+		local now = workspace:GetServerTimeNow()
+		local ok, at = pcall(util.GetNextNightAt, now)
+		if ok and type(at) == "number" and at > now then
+			return at - now
+		end
+		local okLeft, left = pcall(util.GetPhaseTimeLeft, now)
+		if okLeft and type(left) == "number" then
+			return left
+		end
+		return math.huge
+	end
+
 	local selling = {
 		RANK = {
 			Common = 1, Uncommon = 2, Rare = 3, Epic = 4, Legendary = 5,
@@ -1928,6 +2002,9 @@ function Module.Build(ctx)
 		local gap, area = nextAreaGap()
 		-- Three eggs lost in five minutes means the escape prediction is wrong
 		-- about something, and the answer to that is not to try a fourth time.
+		if cycle.shut() then
+			return true, "areas are shut for the night", area, gap
+		end
 		if beingCareful() then
 			return true, "lost three, letting the guards settle", area, gap
 		end
@@ -2053,6 +2130,15 @@ function Module.Build(ctx)
 			return false
 		end
 		local ok, reason = ask(NET.Treadmills.REQUEST_EQUIP_STATIC)
+		-- The server saying we are already on it is the answer we wanted, not a
+		-- refusal. Reading it as one had the farm asking to mount a treadmill it
+		-- was standing on, over and over, for as long as it was grinding: the
+		-- single most repeated impossible request in the journal.
+		if not ok and type(reason) == "string" and reason:find("Already using") then
+			treadmill.active = true
+			accepted("treadmillOn")
+			return true
+		end
 		if ok then
 			-- The event corrects this a moment later either way; believing it
 			-- now is what stops a second request going out on the next tick.
@@ -2675,6 +2761,20 @@ function Module.Build(ctx)
 		-- Wait for the guard to be somewhere else rather than taking it and
 		-- losing it, which is both the difference between six eggs and twelve
 		-- grabs and the difference between farming and looking like a script.
+		-- Night takes the egg out of your hands as surely as a guard does: the
+		-- area resets, you are put outside, and whatever was in transit goes
+		-- with it. So the question before taking one is not only whether the
+		-- guard can be outrun, it is whether there is time.
+		local runHome = homeTarget()
+		if me and runHome then
+			local pace = math.max((core:Humanoid() and core:Humanoid().WalkSpeed or 16) * CARRY_SLOWDOWN, 1)
+			local trip = (Vector3.new(runHome.X, me.Y, runHome.Z) - me).Magnitude / pace
+			if cycle.untilShut() < trip + 4 then
+				stopWalking()
+				return
+			end
+		end
+
 		if me and not willEscape(areaId, me) then
 			-- Wait by the door rather than standing over the egg. Standing still
 			-- inside a guard's reach is how you get hit without even taking
