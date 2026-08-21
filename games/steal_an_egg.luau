@@ -94,7 +94,43 @@ Module.Tips = {
 
 --------------------------------------------------------------------------------
 
+-- A rolling record of the last things the farm said to the server.
+--
+-- Three kicks in and the log still could not answer the only question that
+-- matters, because a snapshot of the moment of the kick says nothing about the
+-- minute before it. Two of the three happened with every switch off and the
+-- character standing still, which rules out the farm's behaviour and leaves
+-- what it had been saying to the server. So every request goes in a ring buffer
+-- with the time since it happened, and the kick log prints the lot.
+--
+-- It lives out here rather than inside Build because Build is one function and
+-- that function is at Luau's ceiling of 200 local registers: one more local in
+-- there and the whole module stops compiling.
+local journal = { keep = 60, entries = {} }
+
+function journal.note(what)
+	local list = journal.entries
+	list[#list + 1] = { at = os.clock(), what = what }
+	if #list > journal.keep then
+		table.remove(list, 1)
+	end
+end
+
+function journal.text()
+	local list = journal.entries
+	if #list == 0 then
+		return "(nothing recorded)"
+	end
+	local now = os.clock()
+	local out = {}
+	for _, entry in ipairs(list) do
+		out[#out + 1] = ("-%.1fs %s"):format(now - entry.at, entry.what)
+	end
+	return table.concat(out, " ; ")
+end
+
 function Module.Build(ctx)
+	journal.entries = {}
 	local core, tabGroup = ctx.core, ctx.TabGroup
 	local F = core.Flags
 
@@ -698,6 +734,15 @@ function Module.Build(ctx)
 	-- good answer here because every action is on a gate that will try again.
 	local ANSWER_WITHIN = 2.5
 
+	-- A rolling record of the last things the farm did.
+	--
+	-- Three kicks in and the log still could not answer the only question that
+	-- matters, because a snapshot of the moment of the kick says nothing about
+	-- the minute before it. Two of the three happened with every switch off and
+	-- the character standing still, which rules out the farm's behaviour and
+	-- leaves what it had been saying to the server. So every request goes in a
+	-- ring buffer with the time since it happened, and the kick log prints the
+	-- lot. The next kick arrives with its own evidence attached.
 	local function answerWithin(fn, ...)
 		local args = table.pack(...)
 		local state = { done = false }
@@ -732,10 +777,13 @@ function Module.Build(ctx)
 			return false, "this game has no " .. action
 		end
 		if remote:IsA("RemoteFunction") then
-			return answerWithin(Network.Invoke, action, ...)
+			local ok, reason = answerWithin(Network.Invoke, action, ...)
+			journal.note(("%s %s"):format(action, ok and "ok" or ("refused: " .. tostring(reason))))
+			return ok, reason
 		end
 		if remote:IsA("RemoteEvent") then
 			local ok, err = pcall(Network.Fire, action, ...)
+			journal.note(("%s %s"):format(action, ok and "fired" or ("failed: " .. tostring(err))))
 			if ok then
 				return true
 			end
@@ -1257,6 +1305,7 @@ function Module.Build(ctx)
 			return false, "No base yet"
 		end
 		local took, reason = answerWithin(EggCmds.RequestPlaceEgg, uid, localCFrame)
+		journal.note(("PlaceEgg %s"):format(took and "ok" or ("refused: " .. tostring(reason))))
 		local ok = true
 		if took then
 			accepted("place")
@@ -1837,6 +1886,41 @@ function Module.Build(ctx)
 		return false
 	end
 
+	-- Getting on, which nothing ever did.
+	--
+	-- The farm walked to the treadmill, stopped, and reported "On the treadmill"
+	-- for as long as you left it there, gaining nothing. The pad is an invisible
+	-- marker: no collision, no prompt, a thousandth of a stud thick and three
+	-- below the floor you stand on. So the obvious reading - step on it and the
+	-- server notices - looked right and was wrong. Measured on a fresh account:
+	-- six seconds standing on it gained nothing, ten seconds walking on the spot
+	-- gained nothing, and one REQUEST_EQUIP_STATIC took ten Speed to forty-two
+	-- in five seconds. Mounting is a request, and until it is made a night on
+	-- the treadmill is a night of standing still.
+	function treadmill.mount()
+		if onTreadmill() then
+			return true
+		end
+		if not nearTreadmill() then
+			return false
+		end
+		if not due("treadmillOn", 3) then
+			return false
+		end
+		local ok, reason = ask(NET.Treadmills.REQUEST_EQUIP_STATIC)
+		if ok then
+			-- The event corrects this a moment later either way; believing it
+			-- now is what stops a second request going out on the next tick.
+			treadmill.active = true
+			accepted("treadmillOn")
+			return true
+		end
+		if refused("treadmillOn", 3) == 1 then
+			sayOnce("mount", "Could not get on the treadmill", tostring(reason or "the server said no"))
+		end
+		return false
+	end
+
 	-- Home is the pet pad, not the spawn point, and the difference is the whole
 	-- of a complaint.
 	--
@@ -2003,6 +2087,7 @@ function Module.Build(ctx)
 		end
 		table.sort(switches)
 		bits[#bits + 1] = "on=" .. table.concat(switches, ",")
+		bits[#bits + 1] = "last=" .. journal.text()
 		return table.concat(bits, " | ")
 	end
 
@@ -2107,6 +2192,7 @@ function Module.Build(ctx)
 				local first = waiting[1]
 				if first then
 					local took = answerWithin(EggCmds.RequestEquipTool, first)
+					journal.note(("EquipTool %s"):format(took and "ok" or "refused"))
 					if took then
 						accepted("unbag")
 						eggUid = first
@@ -2168,6 +2254,9 @@ function Module.Build(ctx)
 					if walkTo(spot, 3) then
 						stopWalking()
 					end
+					-- Gated on being near it, so this is a no-op for the whole
+					-- walk over and one request once it arrives.
+					treadmill.mount()
 					return
 				end
 			end
@@ -2275,6 +2364,7 @@ function Module.Build(ctx)
 		-- succeeding as the egg being taken counted every refusal as a win, which
 		-- is why the farm reported nothing and stood still.
 		local took, reason = answerWithin(EggCmds.RequestCarryAreaEgg, currentTarget.record.Uid)
+		journal.note(("CarryAreaEgg %s %s"):format(tostring(chosenArea), took and "ok" or ("refused: " .. tostring(reason))))
 		local ok = true
 		if took then
 			accepted("carry")
@@ -2940,13 +3030,27 @@ function Module.Build(ctx)
 		end,
 	})
 
-	core:Connect(LocalPlayer.Idled, function()
-		if F.antiAfk == false then
-			return
+	-- Anti AFK. Disabling the Idled connections is quieter than pretending to
+	-- click: VirtualUser is a CoreScript API, so a normal script calling it is
+	-- a loud thing to be doing every twenty minutes all night.
+	task.spawn(function()
+		local ok = pcall(function()
+			for _, connection in ipairs(getconnections(LocalPlayer.Idled)) do
+				connection:Disable()
+			end
+		end)
+		if not ok then
+			core:Connect(LocalPlayer.Idled, function()
+				if F.antiAfk == false then
+					return
+				end
+				pcall(function()
+					local VirtualUser = game:GetService("VirtualUser")
+					VirtualUser:CaptureController()
+					VirtualUser:ClickButton2(Vector2.new())
+				end)
+			end)
 		end
-		local VirtualUser = game:GetService("VirtualUser")
-		VirtualUser:CaptureController()
-		VirtualUser:ClickButton2(Vector2.new())
 	end)
 
 	----------------------------------------------------------------------------
