@@ -56,10 +56,11 @@ Module.Tips = {
 	["Auto Equip Best"] = "Keeps your best pets out, as the game ranks them.",
 	["Equip Best Now"] = "Does it once, right now.",
 	["Auto Sell"] = "Sells pets as they hatch, up to the rarity you pick. Favourites are never sold. Leave this on overnight or the pen fills, hatching stops, and the farm has nowhere to plant.",
-	["Sell Everything"] = "Sells your whole inventory except favourites. There is no undo.",
-	["Sell Up To"] = "Everything at this rarity and below gets sold. Uncommon keeps anything Rare or better.",
+	["Sell Everything Not Favourited"] = "Sells every pet you own that is not out in the pen and not favourited. This is the only bulk sell the game has and it takes no aim, so favourite anything you want kept first. There is no undo.",
+	["Sell Under % Of Worst Out"] = "The line under which a pet is junk, as a share of what your worst equipped pet earns. At 25, anything earning less than a quarter of the weakest pet in your pen goes. Zero switches selling off.",
+	["Sell Up To"] = "The rarity the game auto-sells at as pets hatch. This one is the server's own filter, so it is rarity and not earnings.",
 	["Auto Buy Trail"] = "Buys and wears the best trail you can afford. The trail multiplies your Speed step on top of the treadmill, so it is half of how fast Speed goes up.",
-	["Sell The Junk Now"] = "Sells everything in the pen at or below your Sell Up To rarity. Never equipped pets, never favourites.",
+	["Sell The Junk Now"] = "Favourites everything earning above your line, then sells the rest. Never equipped pets, never your own favourites, and nothing is sold unless every favourite landed first.",
 	["Auto Fuse Runts"] = "Fuses three of the same species when they are small enough that it pays. Three pets become one egg, so it only wins on runts: at ordinary size you get back well under half of what you put in.",
 	["Only Fuse Below"] = "The size a pet has to be under before it is worth fusing. 0.66 is where the maths turns; above it you lose earnings every time.",
 	["Auto Treadmill"] = "Stands on the treadmill and keeps earning Speed while you are not doing anything else.",
@@ -133,6 +134,102 @@ function journal.text()
 		out[#out + 1] = ("-%.1fs %s"):format(now - entry.at, entry.what)
 	end
 	return table.concat(out, " ; ")
+end
+
+-- What a pet earns and what the next thing costs, which are the two numbers
+-- this game hides and every decision depends on.
+--
+-- This is deliberately not a panel. It feeds two things that act: selling by
+-- what a pet actually earns rather than by its rarity badge, and buying the
+-- next base upgrade only when it is affordable instead of asking every two
+-- minutes forever.
+--
+-- It lives at file scope for the same reason the journal does: Build is one
+-- function at Luau's 200 register ceiling. Build hands it what it needs once
+-- through worth.wire, so none of this costs a register in there.
+local worth = { bits = nil }
+
+function worth.wire(bits)
+	worth.bits = bits
+end
+
+-- What one pet earns a second.
+--
+-- GetRate takes a rebirth count as its second argument and asserting on a nil
+-- one is why the first attempt at this returned nothing at all.
+-- GetBaseRateMutationOnly is GetRate at zero rebirths, which is the right
+-- comparison here: rebirth multiplies every pet you own by the same number, so
+-- it moves the totals and never moves the order.
+function worth.rate(item)
+	local bits = worth.bits
+	if not bits or type(item) ~= "table" then
+		return 0
+	end
+	local ok, rate = pcall(bits.AssetGen.GetBaseRateMutationOnly, item)
+	if not ok or type(rate) ~= "number" then
+		return 0
+	end
+	return rate
+end
+
+-- Every pet, sorted by earnings, with the equipped ones marked.
+function worth.pets(data)
+	local rows, pen, out = {}, 0, 0
+	if type(data) ~= "table" or type(data.Inventory) ~= "table" then
+		return rows, 0, 0
+	end
+	local wearing = {}
+	for _, uid in pairs(data.EquippedAssets or {}) do
+		if type(uid) == "string" then
+			wearing[uid] = true
+		end
+	end
+	for uid, item in pairs(data.Inventory) do
+		if type(uid) == "string" and type(item) == "table" then
+			local rate = worth.rate(item)
+			local worn = wearing[uid] == true
+			rows[#rows + 1] = {
+				uid = uid,
+				rate = rate,
+				worn = worn,
+				fav = item.IsFavorite == true,
+				fusing = item.InFuse == true,
+			}
+			pen = pen + rate
+			if worn then
+				out = out + rate
+			end
+		end
+	end
+	table.sort(rows, function(a, b)
+		return a.rate > b.rate
+	end)
+	return rows, pen, out
+end
+
+-- The next base level, its price and whether it is affordable.
+--
+-- Auto Upgrade Base used to fire this remote blind every two minutes whether
+-- the money was there or not, which is the exact pattern that got this account
+-- removed three times: an impossible request on a timer. The ladder is public,
+-- so there is no reason to ask a question the answer to which is already here.
+function worth.nextBase(data)
+	local bits = worth.bits
+	if not bits or type(data) ~= "table" then
+		return nil
+	end
+	local level = tonumber(data.BaseUpgradeLevel) or 0
+	local ladder = bits.Bases.BASES
+	local step = type(ladder) == "table" and ladder[level + 1] or nil
+	if type(step) ~= "table" or not tonumber(step.Cost) then
+		return nil
+	end
+	return {
+		level = level + 1,
+		cost = tonumber(step.Cost),
+		slots = tonumber(step.MaxAssets) or 0,
+		afford = (tonumber(data.Money) or 0) >= tonumber(step.Cost),
+	}
 end
 
 function Module.Build(ctx)
@@ -528,6 +625,14 @@ function Module.Build(ctx)
 		local ok, value = pcall(SpeedPower.GetSpeedPower)
 		return (ok and tonumber(value)) or 0
 	end
+
+	-- Handed over rather than held. Requiring the base ladder inline inside the
+	-- constructor keeps another directory out of Build's register budget, which
+	-- has none left.
+	worth.wire({
+		AssetGen = AssetGen,
+		Bases = require(Directory:WaitForChild("Bases")),
+	})
 
 	-- Which areas to farm, in order, best first.
 	--
@@ -3058,9 +3163,20 @@ function Module.Build(ctx)
 			end
 		end
 
-		if F.baseUpgrade and due("upgrade", 120) then
-			ask(NET.Plots.REQUEST_BASE_UPGRADE)
-			spent("upgrade", 120)
+		-- Only when the money is actually there. This used to fire blind on a
+		-- two minute timer, so an account that could not afford the next base
+		-- asked for it forever, which is the shape of request that has removed
+		-- this account before. The ladder is a public table; there is nothing to
+		-- ask.
+		if F.baseUpgrade and due("upgrade", 30) then
+			local step = worth.nextBase(select(2, pcall(Save.Get)))
+			if step and step.afford then
+				ask(NET.Plots.REQUEST_BASE_UPGRADE)
+				journal.note(("BaseUpgrade %d for %d"):format(step.level, step.cost))
+				core:Notify("Meridian", ("Base %d · %s pets out at once"):format(
+					step.level, step.slots), 5)
+			end
+			spent("upgrade", 30)
 		end
 	end)
 
@@ -3792,7 +3908,6 @@ function Module.Build(ctx)
 	-- running for is usually behind you.
 	--
 	-- One table because Build is at the register ceiling.
-	local live = { rows = {}, needs = {}, seen = {}, started = os.clock() }
 
 	local stealLeft = stealTab:Section({ Side = "Left" })
 	local stealRight = stealTab:Section({ Side = "Right" })
@@ -3802,7 +3917,6 @@ function Module.Build(ctx)
 	local petsRight = petsTab:Section({ Side = "Right" })
 	local progLeft = progressTab:Section({ Side = "Left" })
 	local progRight = progressTab:Section({ Side = "Right" })
-	local indexPanel = progressTab:Section({ Side = "Left" })
 	local visualsLeft = visualsTab:Section({ Side = "Left" })
 	local visualsRight = visualsTab:Section({ Side = "Right" })
 	local playerLeft = playerTab:Section({ Side = "Left" })
@@ -4104,40 +4218,122 @@ function Module.Build(ctx)
 	-- Never an equipped pet and never a favourite: the equipped ones are the
 	-- entire income and selling those to raise cash is the worst trade
 	-- available.
+	-- Selling in this game is not what the endpoint names suggest, and the hub
+	-- had it wrong in both directions.
+	--
+	-- SellAsset does not sell the pet whose uid you send. It sells the tool in
+	-- your hand, and the uid is only checked against it, so calling it for a pet
+	-- sitting in the pen does nothing at all - which is what the sweep had been
+	-- doing all week while reporting success.
+	--
+	-- SellAllAssets does take a list, and ignores it. It sells every pet you own
+	-- that is not equipped, not favourited and not in the fuse machine. Measured:
+	-- a list of exactly one uid sold sixty pets.
+	--
+	-- So there is no such thing as selling one chosen pet from the pen. The only
+	-- selective sell available is to favourite what you want to keep and then
+	-- sell everything else, and that is what this does. Favourites go up first
+	-- and are read back off the server before anything is sold, because a
+	-- favourite that did not land is a pet that gets sold by mistake.
+	selling.pinned = selling.pinned or {}
+
 	selling.sweep = function(loud)
 		local ok, data = pcall(Save.Get)
 		if not ok or type(data) ~= "table" or type(data.Inventory) ~= "table" then
 			return 0
 		end
-		local limit = selling.RANK[F.petsSellUpTo or "Uncommon"] or 2
-		local wearing = {}
-		for _, uid in pairs(data.EquippedAssets or {}) do
-			if type(uid) == "string" then
-				wearing[uid] = true
+
+		-- Rarity is a bad way to decide what is junk, and it is the only way
+		-- every other hub offers. A Mythic at scale 0.3 earns a twentieth of a
+		-- Mythic at scale 3 and the badge on both says Mythic. What matters is
+		-- earnings, and the honest bar is a share of the worst pet currently
+		-- good enough to be out in the pen: anything that far below the team
+		-- will not make the team, and it needs no number tuned as you grow.
+		local rows = worth.pets(data)
+		-- Maclib does not fire a slider's callback when it is created, so the
+		-- flag is nil until somebody drags it. The fallback has to be the same
+		-- number the control shows, or the switch lies about what it does.
+		local share = tonumber(F.petsSellUnder) or 25
+		local floor = 0
+		for _, row in ipairs(rows) do
+			if row.worn then
+				floor = row.rate
 			end
 		end
-		local sold = 0
-		for uid, item in pairs(data.Inventory) do
-			if type(uid) == "string" and type(item) == "table"
-				and item.IsFavorite ~= true and item.InFuse ~= true and not wearing[uid]
-			then
-				local cfg = AssetDirectory[item.Category]
-				local rank = type(cfg) == "table" and type(cfg.Rarity) == "table"
-					and tonumber(cfg.Rarity.RarityNumber) or nil
-				if rank and rank <= limit then
-					if ask(NET.AssetInventory.SELL_ASSET, uid) then
-						sold = sold + 1
+		floor = floor * (math.clamp(share, 0, 100) / 100)
+		if floor <= 0 then
+			return 0
+		end
+
+		-- Who lives. Equipped pets the server already protects; favourites he
+		-- set himself are never touched either way.
+		local pin, unpin, doomed = {}, {}, 0
+		for _, row in ipairs(rows) do
+			if not row.worn and not row.fusing then
+				if row.rate >= floor then
+					if not row.fav then
+						pin[#pin + 1] = row.uid
 					end
-					if sold >= 40 then
-						break
-					end
+				elseif row.fav and selling.pinned[row.uid] then
+					-- We pinned this once and the team has moved past it.
+					unpin[#unpin + 1] = row.uid
+				elseif not row.fav then
+					doomed = doomed + 1
 				end
 			end
 		end
+
+		if doomed == 0 then
+			return 0
+		end
+
+		for _, uid in ipairs(unpin) do
+			ask(NET.AssetInventory.SET_FAVORITE, uid, false)
+			selling.pinned[uid] = nil
+			task.wait(0.05)
+		end
+		for _, uid in ipairs(pin) do
+			ask(NET.AssetInventory.SET_FAVORITE, uid, true)
+			selling.pinned[uid] = true
+			task.wait(0.05)
+		end
+
+		-- Read it back before selling anything. If one favourite did not land,
+		-- selling now would sell a pet we meant to keep, and there is no undo.
+		if #pin > 0 then
+			task.wait(1)
+			local fresh = select(2, pcall(Save.Get))
+			if type(fresh) ~= "table" or type(fresh.Inventory) ~= "table" then
+				return 0
+			end
+			for _, uid in ipairs(pin) do
+				local item = fresh.Inventory[uid]
+				if type(item) ~= "table" or item.IsFavorite ~= true then
+					sayOnce("pin", "Not selling anything",
+						"A pet we meant to keep did not favourite, so nothing was sold")
+					return 0
+				end
+			end
+		end
+
+		local before = 0
+		for _ in pairs(data.Inventory) do
+			before = before + 1
+		end
+		ask(NET.AssetInventory.SELL_ALL_ASSETS, {})
+		task.wait(1.5)
+		local after = select(2, pcall(Save.Get))
+		local left = 0
+		for _ in pairs(type(after) == "table" and after.Inventory or {}) do
+			left = left + 1
+		end
+		local sold = math.max(before - left, 0)
+
 		if sold > 0 then
-			journal.note(("SellJunk %d"):format(sold))
+			journal.note(("SellJunk %d under %d/s"):format(sold, floor))
 			if loud then
-				core:Notify("Meridian", ("Sold %d junk pets"):format(sold), 5)
+				core:Notify("Meridian", ("Sold %d pets under %s a second"):format(
+					sold, short(floor)), 5)
 			end
 		end
 		return sold
@@ -4186,6 +4382,17 @@ function Module.Build(ctx)
 		end
 	end)
 
+	petsRight:Slider({
+		Name = "Sell Under % Of Worst Out",
+		Default = 25,
+		Minimum = 0,
+		Maximum = 90,
+		Precision = 0,
+		Callback = function(value)
+			F.petsSellUnder = value
+		end,
+	}, "petsSellUnder")
+
 	petsRight:Dropdown({
 		Name = "Sell Up To",
 		Multi = false,
@@ -4198,11 +4405,15 @@ function Module.Build(ctx)
 		end,
 	}, "petsSellUpTo")
 
+	-- The list this takes is decorative: the server sells everything not
+	-- equipped, not favourited and not fusing, whatever you send it. Named for
+	-- what it does rather than for the endpoint.
 	petsRight:Button({
-		Name = "Sell Everything",
+		Name = "Sell Everything Not Favourited",
 		Callback = function()
 			task.spawn(function()
-				ask(NET.AssetInventory.SELL_ALL_ASSETS)
+				ask(NET.AssetInventory.SELL_ALL_ASSETS, {})
+				core:Notify("Meridian", "Sold everything not equipped or favourited", 5)
 			end)
 		end,
 	})
@@ -4240,144 +4451,6 @@ function Module.Build(ctx)
 			return
 		end
 		fuse.label:UpdateName(("3 %s · %.2f average"):format(tostring(batch.species), batch.mean))
-	end)
-
-	------------------------------------------------------------------ map tab
-
-	live.tab = tabGroup:Tab({ Name = "Map", Image = "rbxassetid://10723345348" })
-	live.left = live.tab:Section({ Side = "Left" })
-	live.right = live.tab:Section({ Side = "Right" })
-
-	live.left:Header({ Text = "Best On The Map" })
-	live.summary = live.left:Label({ Text = "Looking" })
-	for i = 1, 8 do
-		live.rows[i] = live.left:Label({ Text = "-" })
-	end
-
-	live.right:Header({ Text = "Tell Me About" })
-
-	live.right:Toggle({
-		Name = "Rare Spawns",
-		Default = true,
-		Callback = function(state)
-			F.alertRare = state
-		end,
-	}, "alertRare")
-
-	live.right:Dropdown({
-		Name = "At Least",
-		Multi = false,
-		Required = true,
-		Options = { "Rare", "Epic", "Legendary", "Mythic", "Cosmic", "Secret", "Eternal", "Divine" },
-		Default = 4,
-		Callback = function(value)
-			F.alertRarity = value
-		end,
-	}, "alertRarity")
-
-	live.right:Toggle({
-		Name = "Species I Have Never Hatched",
-		Default = true,
-		Callback = function(state)
-			F.alertFresh = state
-		end,
-	}, "alertFresh")
-
-	live.right:Divider()
-	live.right:Header({ Text = "The Index Still Needs" })
-	for i = 1, 6 do
-		live.needs[i] = live.right:Label({ Text = "-" })
-	end
-
-	-- Two seconds is fast enough to be useful and slow enough that reading the
-	-- map does not cost the farm anything. rankedEggs is cached at a quarter
-	-- second, so this is free either way.
-	core:Loop("map", 2, function()
-		local list = rankedEggs()
-		local shown = 0
-		local bestWorth = -1
-		for _, egg in ipairs(list) do
-			local category = egg.record and egg.record.AssetCategory
-			if egg.worth > bestWorth then
-				bestWorth = egg.worth
-			end
-			if shown < 8 then
-				shown = shown + 1
-				local tag = ""
-				if egg.fresh then
-					tag = " · NEW"
-				end
-				if egg.mutations and #egg.mutations > 0 then
-					tag = tag .. " · " .. table.concat(egg.mutations, "+")
-				end
-				live.rows[shown]:UpdateName(("%s · %s/s · %s · %s · %dm%s"):format(
-					eggName(egg.record),
-					short(egg.worth),
-					tostring(select(2, rarityOf(category)) or "?"),
-					tostring(egg.record and egg.record.AreaId or "?"),
-					math.floor(egg.distance),
-					tag))
-			end
-		end
-		for i = shown + 1, 8 do
-			live.rows[i]:UpdateName("-")
-		end
-		if shown == 0 then
-			live.summary:UpdateName("Nothing on the map right now")
-		else
-			live.summary:UpdateName(("%d out there · best is %s a second"):format(#list, short(bestWorth)))
-		end
-
-		-- What the index is missing, nearest to finished first, because that is
-		-- the one worth going out of your way for.
-		local rows = {}
-		for id, row in pairs(indexProgress()) do
-			local left = row.total - row.got
-			if left > 0 then
-				rows[#rows + 1] = { id = id, left = left, owed = row.owed, missing = row.missing }
-			end
-		end
-		table.sort(rows, function(a, b)
-			return a.left < b.left
-		end)
-		for i = 1, 6 do
-			local row = rows[i]
-			if row then
-				live.needs[i]:UpdateName(("%s · %d to go · %s Speed · %s"):format(
-					row.id, row.left, short(row.owed),
-					table.concat(row.missing, ", "):sub(1, 60)))
-			else
-				live.needs[i]:UpdateName("-")
-			end
-		end
-	end)
-
-	-- Shouting about a spawn, which is the one thing a person at the keyboard
-	-- cannot do for themselves: the map is bigger than the screen and the good
-	-- one is usually behind you.
-	core:Loop("alerts", 1.5, function()
-		if os.clock() - live.started < 12 then
-			return
-		end
-		local floor = selling.RANK[F.alertRarity or "Mythic"] or 6
-		for _, egg in ipairs(rankedEggs()) do
-			local uid = egg.record and egg.record.Uid
-			if uid and not live.seen[uid] then
-				live.seen[uid] = true
-				local category = egg.record.AssetCategory
-				local rank = selling.RANK[tostring(select(2, rarityOf(category)))] or 0
-				local worthShouting = (F.alertRare ~= false and rank >= floor)
-					or (F.alertFresh ~= false and egg.fresh)
-				if worthShouting then
-					core:Notify("Meridian", ("%s · %s/s · %s · %s · %dm"):format(
-						eggName(egg.record),
-						short(egg.worth),
-						egg.fresh and "NEVER HATCHED" or tostring(select(2, rarityOf(category))),
-						tostring(egg.record.AreaId),
-						math.floor(egg.distance)), 8)
-				end
-			end
-		end
 	end)
 
 	------------------------------------------------------------ progress · left
@@ -4488,20 +4561,11 @@ function Module.Build(ctx)
 
 	--------------------------------------------------------------- the index
 	--
-	-- The largest number in this game, and the one nobody looks at.
-	--
 	-- Every species pays an IndexSpeedReward the first time you ever hatch it,
 	-- once, and completing an area's whole drop table hands you that area's bat.
-	-- He has 42 of the 84 and the 42 he is missing are worth 40,586,150 Speed
-	-- Power against the 11.5M he has - four times everything he owns, and the
-	-- only route past Prehistoric at 17M.
-	--
-	-- Which is why this is a panel and not a line: knowing you are one species
-	-- from the Desert Bat is worth more than any toggle on this tab.
-	indexPanel:Header({ Text = "Index" })
-
-	local indexTotal = indexPanel:Label({ Text = "Index · counting" })
-
+	-- The bat is the part worth automating: it is a permanent speed item that
+	-- sits unclaimed because finishing an area and equipping its reward are two
+	-- separate things nobody joins up.
 	local AREA_ORDER = {}
 	for id, area in pairs(AreaDirectory) do
 		if type(area) == "table" and type(area.DropTable) == "table" then
@@ -4515,12 +4579,10 @@ function Module.Build(ctx)
 		return a.tier < b.tier
 	end)
 
-	local indexRows = {}
-	for _, area in ipairs(AREA_ORDER) do
-		indexRows[area.id] = indexPanel:Label({ Text = area.id .. " · counting" })
-	end
+	progRight:Divider()
+	progRight:Header({ Text = "Index" })
 
-	indexPanel:Button({
+	progRight:Button({
 		Name = "Claim Everything",
 		Callback = function()
 			task.spawn(function()
@@ -4532,7 +4594,7 @@ function Module.Build(ctx)
 		end,
 	})
 
-	indexPanel:Toggle({
+	progRight:Toggle({
 		Name = "Equip Best Bat",
 		Default = true,
 		Callback = function(state)
@@ -4540,64 +4602,30 @@ function Module.Build(ctx)
 		end,
 	}, "indexBat")
 
-	core:Loop("index", 6, function()
+	-- The bat from the best area you have finished, checked slowly because
+	-- finishing an area is a thing that happens once an evening at most.
+	core:Loop("index", 20, function()
+		if F.indexBat == false or not due("bat", 45) then
+			return
+		end
 		local progress = indexProgress()
-		local got, total, owed = 0, 0, 0
-		local closest, closestLeft = nil, math.huge
-
+		local best = nil
 		for _, area in ipairs(AREA_ORDER) do
 			local row = progress[area.id]
-			local label = indexRows[area.id]
-			if row and label then
-				got = got + row.got
-				total = total + row.total
-				owed = owed + row.owed
-				local left = row.total - row.got
-				if left > 0 and left < closestLeft then
-					closest, closestLeft = area.id, left
-				end
-				local text
-				if left == 0 then
-					text = ("%s · done · %s"):format(area.id, tostring(row.bat))
-				elseif left <= 3 then
-					text = ("%s · %d of %d · needs %s"):format(
-						area.id, row.got, row.total, table.concat(row.missing, ", "))
-				else
-					text = ("%s · %d of %d · %s Speed left here"):format(
-						area.id, row.got, row.total, short(row.owed))
-				end
-				label:UpdateName(text)
+			if row and row.got >= row.total then
+				best = area.id
 			end
 		end
-
-		local headline
-		if closest then
-			headline = ("Index · %d of %d · %s Speed on the table · closest is %s, %d to go"):format(
-				got, total, short(owed), closest, closestLeft)
+		if not best then
+			return
+		end
+		if ask(NET.Index.REQUEST_EQUIP_AREA_BAT, best) then
+			accepted("bat")
 		else
-			headline = ("Index · %d of %d · every area done"):format(got, total)
-		end
-		indexTotal:UpdateName(headline)
-
-		-- The bat from the best area you have finished. Nothing to do until one
-		-- of them is finished, which is the whole point of the panel above.
-		if F.indexBat ~= false and due("bat", 45) then
-			local best = nil
-			for _, area in ipairs(AREA_ORDER) do
-				local row = progress[area.id]
-				if row and row.got >= row.total then
-					best = area.id
-				end
-			end
-			if best then
-				if ask(NET.Index.REQUEST_EQUIP_AREA_BAT, best) then
-					accepted("bat")
-				else
-					refused("bat", 45)
-				end
-			end
+			refused("bat", 45)
 		end
 	end)
+
 
 	------------------------------------------------------------- visuals · left
 
@@ -4857,7 +4885,6 @@ function Module.Build(ctx)
 			Progress = progressTab,
 			Visuals = visualsTab,
 			Player = playerTab,
-			Map = live.tab,
 		},
 		Default = stealTab,
 		Tips = Module.Tips,
