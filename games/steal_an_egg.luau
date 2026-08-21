@@ -985,8 +985,12 @@ function Module.Build(ctx)
 		local hum = core:Humanoid()
 		local mine = (hum and hum.WalkSpeed or 16) * CARRY_SLOWDOWN
 		local ratio = mine / math.max(guard, 1)
-		-- Level pegging is a coin toss; 15% either way settles it.
-		local prior = math.clamp((ratio - 0.85) / 0.3, 0.05, 1)
+		-- Slower than the guard is close to hopeless, and the first curve did
+		-- not say so: it scored Snow at 21% when he walks 94 against a guard
+		-- that walks 98, and the farm went there and lost six eggs out of six.
+		-- Being outpaced at all is the cliff, so the curve is centred on parity
+		-- rather than 15% below it.
+		local prior = math.clamp((ratio - 0.95) / 0.25, 0.02, 1)
 
 		local row = losses.byArea[areaId]
 		if not row then
@@ -1036,6 +1040,18 @@ function Module.Build(ctx)
 				local was = carrying.active
 				local endedUid = carrying.uid
 				local endedArea = carrying.area
+
+				-- Read the reason now, not in a second's time. The record is
+				-- cleaned up behind us - every loss came back "unknown" when the
+				-- lookup happened after the delay, which told us nothing about
+				-- whether it was a guard, another player, or the night reset.
+				local endedWhy = nil
+				if was and state.IsCarrying ~= true and endedUid and EggCmds.GetAreaEggRecord then
+					local okRecord, record = pcall(EggCmds.GetAreaEggRecord, endedUid)
+					if okRecord and type(record) == "table" then
+						endedWhy = record.DropReason or record.State
+					end
+				end
 				carrying.active = state.IsCarrying == true
 				carrying.uid = carrying.active and state.Uid or nil
 				carrying.slowedTo = tonumber(state.SpeedMultiplier) or 1
@@ -1051,7 +1067,7 @@ function Module.Build(ctx)
 				-- appearing a moment later, or a guard took it off us. Give the
 				-- claim a moment to show up before calling it a loss.
 				if was and not carrying.active and onCarryEnded then
-					onCarryEnded(endedUid, endedArea)
+					onCarryEnded(endedUid, endedArea, endedWhy)
 				end
 			end)
 		end
@@ -1389,7 +1405,7 @@ function Module.Build(ctx)
 
 	-- Now that there is a Tool to look for, the carry-ended signal above can
 	-- tell a claim from a guard taking it off us.
-	onCarryEnded = function(uid, area)
+	onCarryEnded = function(uid, area, why)
 		task.delay(1.2, function()
 			local root = core:Root()
 			local home = root and PlotCmds.IsWorldPositionWithinLocalPlotBounds(root.Position)
@@ -1406,8 +1422,8 @@ function Module.Build(ctx)
 			-- waiting fixes it. Counting them together sends the farm to the
 			-- treadmill for four minutes over something it could not have
 			-- avoided and could not have prevented by stopping.
-			local reason = "unknown"
-			if uid and EggCmds.GetAreaEggRecord then
+			local reason = why and tostring(why) or "unknown"
+			if reason == "unknown" and uid and EggCmds.GetAreaEggRecord then
 				local ok, record = pcall(EggCmds.GetAreaEggRecord, uid)
 				if ok and type(record) == "table" and record.DropReason then
 					reason = tostring(record.DropReason)
