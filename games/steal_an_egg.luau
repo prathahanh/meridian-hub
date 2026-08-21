@@ -58,6 +58,8 @@ Module.Tips = {
 	["Auto Sell"] = "Sells pets as they hatch, up to the rarity you pick. Favourites are never sold. Leave this on overnight or the pen fills, hatching stops, and the farm has nowhere to plant.",
 	["Sell Everything"] = "Sells your whole inventory except favourites. There is no undo.",
 	["Sell Up To"] = "Everything at this rarity and below gets sold. Uncommon keeps anything Rare or better.",
+	["Auto Buy Trail"] = "Buys and wears the best trail you can afford. The trail multiplies your Speed step on top of the treadmill, so it is half of how fast Speed goes up.",
+	["Sell The Junk Now"] = "Sells everything in the pen at or below your Sell Up To rarity. Never equipped pets, never favourites.",
 	["Auto Fuse Runts"] = "Fuses three of the same species when they are small enough that it pays. Three pets become one egg, so it only wins on runts: at ordinary size you get back well under half of what you put in.",
 	["Only Fuse Below"] = "The size a pet has to be under before it is worth fusing. 0.66 is where the maths turns; above it you lose earnings every time.",
 	["Auto Treadmill"] = "Stands on the treadmill and keeps earning Speed while you are not doing anything else.",
@@ -1690,7 +1692,7 @@ function Module.Build(ctx)
 	-- should depend on not happening. So instead of switching their steering
 	-- off, this runs one step later in the same frame and steers itself. Same
 	-- call they make, same frame, ours last.
-	local steer = { direction = nil }
+	local steer = { direction = nil, lastF = 0, lastR = 0 }
 
 	local function treadmillSpot()
 		local data = plotData()
@@ -1745,13 +1747,32 @@ function Module.Build(ctx)
 		local right = Vector3.new(-ahead.Z, 0, ahead.X)
 		-- sin(22.5 degrees), which is where one key stops and two begin.
 		local EDGE = 0.3827
+		-- Hysteresis, which is the whole difference between this and the zig
+		-- zag he watched. A player holding W and D walks one straight diagonal;
+		-- they do not let go and press again forty times a second. Re-deciding
+		-- the key from scratch every frame does exactly that whenever the true
+		-- bearing sits near a boundary, because the smallest wobble flips the
+		-- answer. So a key that is already held needs a clearly worse bearing
+		-- before it is released than an idle one needs to be pressed.
+		local LOOSE = 0.28
 		local forward = direction:Dot(ahead)
 		local across = direction:Dot(right)
-		local f = (forward > EDGE and 1) or (forward < -EDGE and -1) or 0
-		local r = (across > EDGE and 1) or (across < -EDGE and -1) or 0
+		local function pick(value, held)
+			local enter = held ~= 0 and LOOSE or EDGE
+			if value > enter then
+				return 1
+			end
+			if value < -enter then
+				return -1
+			end
+			return 0
+		end
+		local f = pick(forward, steer.lastF or 0)
+		local r = pick(across, steer.lastR or 0)
 		if f == 0 and r == 0 then
 			return direction
 		end
+		steer.lastF, steer.lastR = f, r
 		local out = ahead * f + right * r
 		return out.Magnitude > 0.01 and out.Unit or direction
 	end
@@ -3037,12 +3058,72 @@ function Module.Build(ctx)
 	-- cannot afford, so a refusal counts as a refusal and the gate backs it off.
 	core:Loop("speed", 5, function()
 		watchTreadmillRate(mySpeedPower())
+		-- The treadmill upgrade takes the id of the treadmill you are buying.
+		-- The hub sent nothing at all, so this has never once worked - the same
+		-- shape of bug as Auto Sell, and worth more than either: the step
+		-- multiplier runs 80 at Golden, 100 at The Freeze, 200 at Lucky Block,
+		-- 500 at Hacker, and every one of them multiplies everything the
+		-- treadmill ever earns after it.
+		--
+		-- Affordability is checked here rather than left to the server, because
+		-- the answer to "no" is to wait, and asking anyway every twenty seconds
+		-- for the hours it takes to save three billion is the exact habit that
+		-- gets accounts removed.
 		if F.speedUpgrade and due("treadmill", 20) then
-			if ask(NET.Treadmills.REQUEST_UPGRADE) then
-				accepted("treadmill")
-				core:Notify("Meridian", "Bought the next treadmill", 4)
-			else
-				refused("treadmill", 20)
+			local shop = require(ReplicatedStorage.Directory.Treadmills)
+			local saved = select(2, pcall(Save.Get))
+			local level = type(saved) == "table" and tonumber(saved.TreadmillUpgradeLevel) or nil
+			local okNext, next = false, nil
+			if level and type(shop.GetByUpgradeLevel) == "function" then
+				okNext, next = pcall(shop.GetByUpgradeLevel, level + 1)
+			end
+			if okNext and type(next) == "table" and next._id then
+				local price = tonumber(next.Price) or math.huge
+				if (saved.Money or 0) >= price then
+					if ask(NET.Treadmills.REQUEST_UPGRADE, next._id) then
+						accepted("treadmill")
+						core:Notify("Meridian", ("Bought the %s"):format(tostring(next._id)), 5)
+					else
+						refused("treadmill", 20)
+					end
+				end
+			end
+		end
+
+		-- The trail multiplies the Speed step on top of the treadmill, so it is
+		-- the other half of the same sum and nothing was buying it either.
+		-- Red is 4x, Galaxy 5x, Secret 7x, Eternal 10x, Divine 14x.
+		if F.speedTrail and due("trail", 30) then
+			local shop = require(ReplicatedStorage.Directory.Trails)
+			local saved = select(2, pcall(Save.Get))
+			if type(saved) == "table" then
+				local owned = saved.TrailInventory or {}
+				local wearing = saved.EquippedTrail
+				local list = shop.Directory or shop
+				local best = wearing and type(list[wearing]) == "table"
+					and (tonumber(list[wearing].SpeedMultiplier) or 0) or 0
+				local want, wantMulti = nil, best
+				for id, cfg in pairs(list) do
+					local multi = type(cfg) == "table" and tonumber(cfg.SpeedMultiplier) or nil
+					local price = type(cfg) == "table" and tonumber(cfg.Price) or nil
+					if multi and price and multi > wantMulti
+						and (owned[id] == true or (saved.Money or 0) >= price)
+					then
+						want, wantMulti = id, multi
+					end
+				end
+				if want then
+					local got = owned[want] == true
+					if not got then
+						got = ask(NET.Trails.REQUEST_PURCHASE, want)
+					end
+					if got and ask(NET.Trails.REQUEST_SELECT, want) then
+						accepted("trail")
+						core:Notify("Meridian", ("Wearing the %s, %sx Speed"):format(tostring(want), tostring(wantMulti)), 5)
+					else
+						refused("trail", 30)
+					end
+				end
 			end
 		end
 	end)
@@ -3963,6 +4044,52 @@ function Module.Build(ctx)
 	-- having room, which stops planting, which strands the farm at the pad
 	-- holding an egg it cannot put down. Selling the bottom of the ladder is
 	-- what keeps a night moving.
+	-- Auto Sell only catches pets as they hatch. Everything already in the pen
+	-- when it was switched on stays there forever, which is most of the money
+	-- sitting in a list nobody looks at. This sweeps them.
+	--
+	-- Never an equipped pet and never a favourite: the equipped ones are the
+	-- entire income and selling those to raise cash is the worst trade
+	-- available.
+	selling.sweep = function(loud)
+		local ok, data = pcall(Save.Get)
+		if not ok or type(data) ~= "table" or type(data.Inventory) ~= "table" then
+			return 0
+		end
+		local limit = selling.RANK[F.petsSellUpTo or "Uncommon"] or 2
+		local wearing = {}
+		for _, uid in pairs(data.EquippedAssets or {}) do
+			if type(uid) == "string" then
+				wearing[uid] = true
+			end
+		end
+		local sold = 0
+		for uid, item in pairs(data.Inventory) do
+			if type(uid) == "string" and type(item) == "table"
+				and item.IsFavorite ~= true and item.InFuse ~= true and not wearing[uid]
+			then
+				local cfg = AssetDirectory[item.Category]
+				local rank = type(cfg) == "table" and type(cfg.Rarity) == "table"
+					and tonumber(cfg.Rarity.RarityNumber) or nil
+				if rank and rank <= limit then
+					if ask(NET.AssetInventory.SELL_ASSET, uid) then
+						sold = sold + 1
+					end
+					if sold >= 40 then
+						break
+					end
+				end
+			end
+		end
+		if sold > 0 then
+			journal.note(("SellJunk %d"):format(sold))
+			if loud then
+				core:Notify("Meridian", ("Sold %d junk pets"):format(sold), 5)
+			end
+		end
+		return sold
+	end
+
 	selling.push = function()
 		local map = {}
 		if F.petsAutoSell then
@@ -3987,6 +4114,24 @@ function Module.Build(ctx)
 			task.spawn(selling.push)
 		end,
 	}, "petsAutoSell")
+
+	petsRight:Button({
+		Name = "Sell The Junk Now",
+		Callback = function()
+			task.spawn(function()
+				local sold = selling.sweep(true)
+				if sold == 0 then
+					core:Notify("Meridian", "Nothing in the pen worth selling", 4)
+				end
+			end)
+		end,
+	})
+
+	core:Loop("sweep", 30, function()
+		if F.petsAutoSell and due("sweep", 120) then
+			selling.sweep(false)
+		end
+	end)
 
 	petsRight:Dropdown({
 		Name = "Sell Up To",
@@ -4055,6 +4200,14 @@ function Module.Build(ctx)
 			F.speedUpgrade = state
 		end,
 	}, "speedUpgrade")
+
+	progLeft:Toggle({
+		Name = "Auto Buy Trail",
+		Default = true,
+		Callback = function(state)
+			F.speedTrail = state
+		end,
+	}, "speedTrail")
 
 	progLeft:Toggle({
 		Name = "Treadmill For The Next Area",
