@@ -3465,6 +3465,13 @@ function Module.Build(ctx)
 	-- The dashboard reads fixed keys off core.Stats, and core.Headline is the
 	-- one line it shows above them. A game module never touches the interface
 	-- itself, so this is the whole of what it publishes.
+	-- Published so the journal and the per-area record can be read while it is
+	-- running, rather than only after a kick has already written them to a file.
+	-- The overnight run is eight hours long and the console buffer does not
+	-- survive a rejoin, so this is the only way to ask what happened.
+	core.Journal = journal
+	core.Losses = losses
+
 	core:Loop("stats", 1, function()
 		local minutes = math.max((os.clock() - stats.started) / 60, 1 / 60)
 		local leaderstats = LocalPlayer:FindFirstChild("leaderstats")
