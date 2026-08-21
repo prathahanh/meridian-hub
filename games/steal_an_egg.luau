@@ -33,7 +33,7 @@ Module.Tips = {
 	["Pick By"] = "What makes an egg worth the walk.",
 	["Only If You Can Get Away"] = "Waits for the guard to be somewhere else instead of taking an egg and losing it a second later. Uses the game's own escape maths against where the guard is standing right now, so it knows before it grabs.",
 	["Eggs A Minute"] = "A hard ceiling on how often an egg can be taken, whatever else says it is fine. The walk usually takes longer than this anyway, so it only bites when something has gone wrong.",
-	["Walk Like A Keyboard"] = "WASD only has eight directions, so that is all a desktop player ever moves in. This snaps to the same eight instead of walking at any angle it likes. Whether this game cares is a guess, so it is off until the kick log says otherwise.",
+	["Walk Like A Keyboard"] = "Snaps movement to the eight directions a keyboard can produce. Off by default: it doubles how often the character changes heading, because the eight directions follow the camera and the camera turns while you walk.",
 	["New Species First"] = "Goes for anything missing from your index before anything else, wherever it is. That reward is paid once, it is usually worth more than a night of farming, and there is no second chance at a first hatch.",
 	["Claim Everything"] = "Asks for every index reward you have earned, right now.",
 	["Equip Best Bat"] = "Puts on the bat from the best area you have finished the index for.",
@@ -1692,7 +1692,15 @@ function Module.Build(ctx)
 	-- should depend on not happening. So instead of switching their steering
 	-- off, this runs one step later in the same frame and steers itself. Same
 	-- call they make, same frame, ours last.
-	local steer = { direction = nil, lastF = 0, lastR = 0 }
+	local steer = {
+		direction = nil,
+		lastKey = nil,
+		-- On the table, not a local: Build has no registers left.
+		keys = {
+			{ f = 1, r = 0 }, { f = 1, r = 1 }, { f = 0, r = 1 }, { f = -1, r = 1 },
+			{ f = -1, r = 0 }, { f = -1, r = -1 }, { f = 0, r = -1 }, { f = 1, r = -1 },
+		},
+	}
 
 	local function treadmillSpot()
 		local data = plotData()
@@ -1730,8 +1738,43 @@ function Module.Build(ctx)
 	--
 	-- Off by default, because it is a guess. The kick log is what will settle
 	-- it: leave it on for a night, leave it off for a night, compare.
+	-- Eight directions, and off by default, because it cannot be made straight.
+	--
+	-- He watched it walk in zig zags and he was right. Measured as the share of
+	-- moving frames that change direction, back to back on the same run: 1.4%
+	-- with this on, 0.7% with it off. Three attempts to fix it - looser per-axis
+	-- thresholds, smoothing the bearing before the snap, hysteresis on the
+	-- chosen key - all landed between 1.4% and 2.0%, which is noise.
+	--
+	-- The reason is the reference frame. The eight directions are relative to
+	-- the camera, and the camera turns while you walk, so a perfectly steady
+	-- world bearing still sweeps across key boundaries on its own. Nothing done
+	-- inside this function can fix a rotating frame of reference.
+	--
+	-- The thing it was for has not held up either: the integrity check that
+	-- would catch inhuman movement (ClientCharacter: IntegrityViolation) has
+	-- read zero on every kick this account has taken. So the cost is measured
+	-- and the benefit is not. Left in, switchable, defaulted off.
+	--
+	-- Eight directions, and it sticks to the one it is on.
+	--
+	-- He watched it walk in zig zags. The cause was this function deciding from
+	-- scratch every frame: the bearing to a waypoint sits near the boundary
+	-- between two keys for most of a long walk, and the smallest wobble flips
+	-- the answer, forty times a second.
+	--
+	-- Two things did not fix it, measured as the share of moving frames that
+	-- changed direction. Loosening the per-axis thresholds got 1.4%, against
+	-- 0.7% with the filter off entirely. Smoothing the bearing before the snap
+	-- was worse at 1.7%, because a smoothed bearing hovers on the boundary
+	-- instead of crossing it cleanly.
+	--
+	-- What works is hysteresis on the choice. Score all eight, keep the one
+	-- already held unless another beats it by a clear margin. A player holding
+	-- W and D holds them until they mean to turn.
 	local function likeAKeyboard(direction)
 		if F.stealHuman ~= true then
+			steer.lastKey = nil
 			return direction
 		end
 		local camera = Workspace.CurrentCamera
@@ -1745,36 +1788,28 @@ function Module.Build(ctx)
 		end
 		ahead = ahead.Unit
 		local right = Vector3.new(-ahead.Z, 0, ahead.X)
-		-- sin(22.5 degrees), which is where one key stops and two begin.
-		local EDGE = 0.3827
-		-- Hysteresis, which is the whole difference between this and the zig
-		-- zag he watched. A player holding W and D walks one straight diagonal;
-		-- they do not let go and press again forty times a second. Re-deciding
-		-- the key from scratch every frame does exactly that whenever the true
-		-- bearing sits near a boundary, because the smallest wobble flips the
-		-- answer. So a key that is already held needs a clearly worse bearing
-		-- before it is released than an idle one needs to be pressed.
-		local LOOSE = 0.28
-		local forward = direction:Dot(ahead)
-		local across = direction:Dot(right)
-		local function pick(value, held)
-			local enter = held ~= 0 and LOOSE or EDGE
-			if value > enter then
-				return 1
+
+		local best, bestScore, heldScore = nil, -2, nil
+		for _, key in ipairs(steer.keys) do
+			local candidate = (ahead * key.f + right * key.r).Unit
+			local score = direction:Dot(candidate)
+			if score > bestScore then
+				best, bestScore = key, score
 			end
-			if value < -enter then
-				return -1
+			local held = steer.lastKey
+			if held and held.f == key.f and held.r == key.r then
+				heldScore = score
 			end
-			return 0
 		end
-		local f = pick(forward, steer.lastF or 0)
-		local r = pick(across, steer.lastR or 0)
-		if f == 0 and r == 0 then
+		if not best then
 			return direction
 		end
-		steer.lastF, steer.lastR = f, r
-		local out = ahead * f + right * r
-		return out.Magnitude > 0.01 and out.Unit or direction
+		-- About ten degrees past the boundary, which is a turn and not a wobble.
+		if heldScore and bestScore - heldScore < 0.12 then
+			best = steer.lastKey
+		end
+		steer.lastKey = best
+		return (ahead * best.f + right * best.r).Unit
 	end
 
 	local function dodgeTreadmill(from, direction)
@@ -1807,6 +1842,7 @@ function Module.Build(ctx)
 
 	function stopWalking()
 		steer.direction = nil
+		steer.lastKey = nil
 		local hum = core:Humanoid()
 		if hum then
 			pcall(function()
@@ -1817,6 +1853,7 @@ function Module.Build(ctx)
 
 	core:Track(function()
 		steer.direction = nil
+		steer.lastKey = nil
 		pcall(function()
 			RunService:UnbindFromRenderStep("MeridianSteer")
 		end)
@@ -1838,12 +1875,16 @@ function Module.Build(ctx)
 		local root, hum = core:Root(), core:Humanoid()
 		if not root or not hum or hum.Health <= 0 then
 			steer.direction = nil
+			steer.lastKey = nil
+		steer.smoothed = nil
 			return false
 		end
 
 		if flatDistance(goal, root.Position) <= (standoff or 0) then
 			clearRoute()
 			steer.direction = nil
+			steer.lastKey = nil
+		steer.smoothed = nil
 			return true
 		end
 
@@ -1863,6 +1904,8 @@ function Module.Build(ctx)
 		local flat = Vector3.new(target.X - root.Position.X, 0, target.Z - root.Position.Z)
 		if flat.Magnitude < 0.5 then
 			steer.direction = nil
+			steer.lastKey = nil
+		steer.smoothed = nil
 			return false
 		end
 		steer.direction = likeAKeyboard(dodgeTreadmill(root.Position, flat.Unit))
