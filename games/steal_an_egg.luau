@@ -171,13 +171,30 @@ function seeded.apply(core)
 		if flag and flags[flag] == nil and (kind == "Slider" or kind == "Dropdown") then
 			local settings = entry.control and entry.control.Settings
 			local default = type(settings) == "table" and settings.Default or nil
-			if kind == "Slider" and tonumber(default) then
-				flags[flag] = tonumber(default)
-			elseif kind == "Dropdown" and type(settings) == "table" then
+			local value = nil
+			if kind == "Slider" then
+				value = tonumber(default)
+			elseif type(settings) == "table" then
 				local options = settings.Options
 				local index = tonumber(default)
-				if type(options) == "table" and index and options[index] ~= nil then
-					flags[flag] = options[index]
+				if type(options) == "table" and index then
+					value = options[index]
+				end
+			end
+			if value ~= nil then
+				-- Set the flag, then run the control's own callback.
+				--
+				-- Setting the flag alone is not enough: Worth At Least writes
+				-- stealFloorName *and* derives stealFloor from it, and half a
+				-- default is its own kind of wrong. Running the callback is
+				-- what the control would have done if Maclib had fired it, so
+				-- it is the behaviour being restored rather than copied.
+				--
+				-- Wrapped, because one callback that throws at build time would
+				-- take the whole hub down with it.
+				flags[flag] = value
+				if type(settings.Callback) == "function" then
+					pcall(settings.Callback, value)
 				end
 			end
 		end
