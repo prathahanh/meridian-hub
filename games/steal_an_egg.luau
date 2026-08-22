@@ -3421,7 +3421,11 @@ function Module.Build(ctx)
 			return
 		end
 		if due("offline", 90) then
-			if ask(NET.OfflineAssets.REQUEST_REDEEM) then
+			-- {Kind = "Claim"} is what the game's own claim button sends. Called
+			-- bare, the server threw "table expected, got nil" out of
+			-- ActiveAssetsController, so this has never once collected an
+			-- offline pile.
+			if ask(NET.OfflineAssets.REQUEST_REDEEM, { Kind = "Claim" }) then
 				accepted("offline")
 			else
 				refused("offline", 90)
@@ -3610,10 +3614,64 @@ function Module.Build(ctx)
 				return false
 			end,
 		},
-		{ flag = "progIndex", key = "indexEgg", every = 180, action = NET.Index.REQUEST_CLAIM_LIMITED_EGG_REWARD },
+		-- "Complete the Limited Egg index first" is a refusal you can predict.
+		-- The limited egg has its own small drop table and the save says which
+		-- of them have been hatched, so asking before it is finished is asking
+		-- a question with a known answer.
+		{ flag = "progIndex", key = "indexEgg", every = 180, action = NET.Index.REQUEST_CLAIM_LIMITED_EGG_REWARD,
+			ready = function(saved)
+				local hatched = type(saved) == "table" and saved.Index or nil
+				if type(hatched) ~= "table" then
+					return true
+				end
+				local ok, limited = pcall(require, Directory:WaitForChild("LimitedEgg"))
+				local drops = ok and type(limited) == "table" and limited.DropTable or nil
+				if type(drops) ~= "table" then
+					return true
+				end
+				for key, entry in pairs(drops) do
+					local species = type(entry) == "table" and entry[1] or key
+					if species and not hatched[species] then
+						return false
+					end
+				end
+				return true
+			end,
+		},
+		-- CLAIM_REWARD asserts on a boolean and the hub sent nothing, so every
+		-- call came back as an assertion failure out of GroupRewards:184. The
+		-- boolean is whether you are in the group, which the game's own button
+		-- resolves with IsInGroupAsync before it asks.
+		--
+		-- That is a web call, so it is asked once and remembered. And if the
+		-- answer is no there is nothing to claim at all: on this account it is
+		-- no, which is why the switch has never worked and never could.
 		{ flag = "progGroup", key = "group", every = 300, action = NET.GroupReward.CLAIM_REWARD,
 			ready = function(saved)
-				return not (type(saved) == "table" and saved.ClaimedGroupReward == true)
+				if type(saved) == "table" and saved.ClaimedGroupReward == true then
+					return false
+				end
+				if worth.inGroup == nil then
+					if not worth.askingGroup then
+						worth.askingGroup = true
+						task.spawn(function()
+							local ok, member = pcall(function()
+								return LocalPlayer:IsInGroupAsync(Constants.GROUP_ID)
+							end)
+							worth.inGroup = (ok and member) == true
+							worth.askingGroup = nil
+							if worth.inGroup == false then
+								sayOnce("group", "No group reward to claim",
+									"You are not in the group, so there is nothing for the server to give")
+							end
+						end)
+					end
+					return false
+				end
+				return worth.inGroup == true
+			end,
+			args = function()
+				return worth.inGroup == true
 			end,
 		},
 		{ flag = "progGifts", key = "gifts", every = 120, action = NET.FreeGifts.REQUEST_CLAIM },
@@ -3635,7 +3693,13 @@ function Module.Build(ctx)
 				and (claim.ready == nil or claim.ready(saved) == true)
 				and due(claim.key, claim.every)
 			then
-				if ask(claim.action) then
+				local sent
+				if claim.args then
+					sent = ask(claim.action, claim.args())
+				else
+					sent = ask(claim.action)
+				end
+				if sent then
 					accepted(claim.key)
 				else
 					refused(claim.key, claim.every)
