@@ -261,6 +261,29 @@ function worth.pets(data)
 	return rows, pen, out
 end
 
+-- What the weakest pet currently out earns, which is the bar any new egg has to
+-- clear to be worth a walk.
+--
+-- Cached for five seconds. The farm tick asks this several times a second and
+-- the answer only moves when a pet is hatched, sold or swapped, so recomputing
+-- a rate for every pet in the pen on every tick is a few hundred pointless
+-- multiplications a second.
+function worth.weakest(data)
+	local now = os.clock()
+	if worth.weakestAt and now - worth.weakestAt < 5 then
+		return worth.weakestWas or 0
+	end
+	local rows = worth.pets(data)
+	local weakest = 0
+	for _, row in ipairs(rows) do
+		if row.worn then
+			weakest = row.rate
+		end
+	end
+	worth.weakestAt, worth.weakestWas = now, weakest
+	return weakest
+end
+
 -- The next base level, its price and whether it is affordable.
 --
 -- Auto Upgrade Base used to fire this remote blind every two minutes whether
@@ -324,13 +347,7 @@ function worth.shop(data)
 	-- itself or it waits until the pen has grown into it.
 	local step = worth.nextBase(data)
 	if step and step.afford then
-		local rows = worth.pets(data)
-		local weakest = 0
-		for _, row in ipairs(rows) do
-			if row.worn then
-				weakest = row.rate
-			end
-		end
+		local weakest = worth.weakest(data)
 		local payback = weakest > 0 and (step.cost / weakest) or math.huge
 		if payback <= 21600 then
 			offer("base", step.cost, nil, ("Base %d"):format(step.level))
@@ -2341,7 +2358,26 @@ function Module.Build(ctx)
 		if earning <= 0 or share <= 0 then
 			return true
 		end
-		return egg.worth >= earning * share
+		local bar = earning * share
+
+		-- Never refuse an egg that would make the team.
+		--
+		-- A share of total income is a fine rule while the pen is even and a
+		-- self-defeating one once it is not. The bar rises with everything you
+		-- earn, so the better the farm does the less it is willing to walk for,
+		-- and past a point it refuses every egg on the map and stands on the
+		-- treadmill for good. That is the farm switching itself off for being
+		-- successful.
+		--
+		-- What actually matters is whether the egg beats the weakest pet
+		-- already out, because that is the one it would replace. So the bar is
+		-- capped there: below it the old rule still applies, above it the rule
+		-- would be refusing a straight upgrade.
+		local weakest = worth.weakest(select(2, pcall(Save.Get)))
+		if weakest > 0 then
+			bar = math.min(bar, weakest)
+		end
+		return egg.worth >= bar
 	end
 
 	-- Two reasons to be standing on it, and the second one is the one he asked
