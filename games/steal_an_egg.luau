@@ -147,6 +147,43 @@ end
 -- It lives at file scope for the same reason the journal does: Build is one
 -- function at Luau's 200 register ceiling. Build hands it what it needs once
 -- through worth.wire, so none of this costs a register in there.
+-- Maclib fires a Toggle's callback when it is created and does not fire a
+-- Slider's or a Dropdown's. So every slider and dropdown in this file shows a
+-- default that never reaches the flags, and what actually runs is whatever
+-- fallback the reading code happens to use.
+--
+-- Mostly those agree. Pick By did not: the control read Best Nearby and the
+-- farm ran Most Valuable, for as long as the control has existed. That is the
+-- worst kind of bug in a hub, because the person judging it is reading the
+-- interface.
+--
+-- Rather than keep two numbers in step by hand, the declared default is copied
+-- into the flag once the tabs are built. The control becomes the only place a
+-- default lives, and a fallback in the reading code goes back to being a guard
+-- against a flag that was never declared at all.
+local seeded = {}
+
+function seeded.apply(core)
+	local flags = core.Flags
+	for _, entry in ipairs(core.Controls or {}) do
+		local flag = entry.flag or entry.Flag
+		local kind = entry.kind or entry.Kind
+		if flag and flags[flag] == nil and (kind == "Slider" or kind == "Dropdown") then
+			local settings = entry.control and entry.control.Settings
+			local default = type(settings) == "table" and settings.Default or nil
+			if kind == "Slider" and tonumber(default) then
+				flags[flag] = tonumber(default)
+			elseif kind == "Dropdown" and type(settings) == "table" then
+				local options = settings.Options
+				local index = tonumber(default)
+				if type(options) == "table" and index and options[index] ~= nil then
+					flags[flag] = options[index]
+				end
+			end
+		end
+	end
+end
+
 local worth = { bits = nil }
 
 function worth.wire(bits)
@@ -4089,7 +4126,10 @@ function Module.Build(ctx)
 		Multi = false,
 		Required = true,
 		Options = { "Best Nearby", "Most Valuable", "Nearest" },
-		Default = 1,
+		-- Two, not one. The code has always fallen back to Most Valuable and
+		-- the control has always displayed Best Nearby, so every screenshot he
+		-- has judged was of a farm doing something other than what it said.
+		Default = 2,
 		Callback = function(value)
 			F.stealPick = value
 		end,
@@ -4981,6 +5021,10 @@ function Module.Build(ctx)
 	-- from in here runs the tab transition before the window is finished and
 	-- Maclib's tween throws, so the module says which tab it wants and lets the
 	-- loader pick the moment.
+	-- Every slider and dropdown default, copied into the flags now that the
+	-- controls exist. Nothing here yields, which Build may not do.
+	seeded.apply(core)
+
 	return {
 		Tabs = {
 			Steal = stealTab,
