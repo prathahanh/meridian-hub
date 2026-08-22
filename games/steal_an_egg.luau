@@ -197,6 +197,199 @@ function seeded.apply(core)
 	end
 end
 
+-- The Great Bloom, which arrived in the game while this was being written.
+--
+-- Sakura trees spawn across the map for 285 seconds every half hour. You hit
+-- them with a bat, they drop crystals, and a thousand crystals buys one roll at
+-- the incubator that puts a Sakura mutation on an egg. The special roll,
+-- GreatBloom, is Divine.
+--
+-- The gate is the crane. Cherry Blossom is a new area whose drop table starts
+-- with Crane at weight 37, and the tree will not wake up until you have carried
+-- one back to it. So the order is: farm Cherry Blossom, hatch a Crane, return
+-- it, then break trees.
+local sakura = { bits = nil, hits = 0, crystals = 0, said = {} }
+
+function sakura.wire(bits)
+	sakura.bits = bits
+end
+
+-- Seconds left in the current bloom, or nil when there is none. The server
+-- publishes both as plain attributes on workspace, so there is nothing to ask.
+function sakura.blooming()
+	local ws = game:GetService("Workspace")
+	if ws:GetAttribute("Event_GreatBloom") ~= true then
+		return nil
+	end
+	local endsAt = tonumber(ws:GetAttribute("GreatBloomEndsAt"))
+	if not endsAt then
+		return nil
+	end
+	local left = endsAt - ws:GetServerTimeNow()
+	if left <= 0 then
+		return nil
+	end
+	return left
+end
+
+function sakura.unlocked()
+	local bits = sakura.bits
+	local ok, data = pcall(bits.Save.Get)
+	local state = ok and type(data) == "table" and data.Sakura or nil
+	return type(state) == "table" and state.Unlocked == true
+end
+
+-- Do we own a crane to give it? The inventory is the pen, so this is the pet
+-- rather than the egg: it has to have hatched.
+function sakura.crane()
+	local bits = sakura.bits
+	local ok, data = pcall(bits.Save.Get)
+	if not ok or type(data) ~= "table" then
+		return false
+	end
+	for _, item in pairs(data.Inventory or {}) do
+		if type(item) == "table" and tostring(item.Category) == "Crane" then
+			return true
+		end
+	end
+	return false
+end
+
+function sakura.shrine()
+	local CS = game:GetService("CollectionService")
+	local main = CS:GetTagged("MainSakuraTree")[1]
+	if not main then
+		return nil
+	end
+	local ok, pivot = pcall(function()
+		return main:GetPivot().Position
+	end)
+	return ok and pivot or nil
+end
+
+-- The nearest tree still standing. Trees carry their own Hits and HitsRequired
+-- as attributes, so a tree that is already down is visible without asking.
+function sakura.tree(from)
+	local CS = game:GetService("CollectionService")
+	local best, bestGap = nil, math.huge
+	for _, tree in ipairs(CS:GetTagged("SakuraBloomTree")) do
+		local hits = tonumber(tree:GetAttribute("Hits")) or 0
+		local needs = tonumber(tree:GetAttribute("HitsRequired")) or 1
+		if hits < needs and tree:GetAttribute("TreeLoaded") ~= false then
+			local ok, pivot = pcall(function()
+				return tree:GetPivot().Position
+			end)
+			if ok then
+				local gap = (Vector3.new(pivot.X, from.Y, pivot.Z) - from).Magnitude
+				if gap < bestGap then
+					best, bestGap = tree, gap
+				end
+			end
+		end
+	end
+	return best, bestGap
+end
+
+-- Crystals are free money and they expire in sixty seconds, so they are taken
+-- before anything else and without walking anywhere for them.
+function sakura.sweep(from, reach)
+	local CS = game:GetService("CollectionService")
+	local bits = sakura.bits
+	local took = 0
+	for _, crystal in ipairs(CS:GetTagged("SakuraCrystal")) do
+		local ok, pivot = pcall(function()
+			return crystal:GetPivot().Position
+		end)
+		if ok and (pivot - from).Magnitude <= reach then
+			if bits.ask(bits.NET.Sakura.REQUEST_COLLECT_CRYSTAL, crystal) then
+				took = took + 1
+				sakura.crystals = sakura.crystals + 1
+			end
+			if took >= 6 then
+				break
+			end
+		end
+	end
+	return took
+end
+
+-- One step per call, and it says whether it took the legs.
+--
+-- The egg farm and this share one character. Whichever of them is walking has
+-- to be the only one walking, so this runs first and the farm tick asks it
+-- whether it is busy before doing anything of its own.
+function sakura.tick()
+	local bits = sakura.bits
+	if not bits then
+		return false
+	end
+	local F = bits.F
+	local here = bits.here()
+	if not here then
+		return false
+	end
+
+	-- Crystals first, wherever we are. They expire and they cost nothing.
+	if F.eventCrystals ~= false then
+		sakura.sweep(here, 10)
+	end
+
+	-- The crane wakes the tree up, and nothing else works until it has.
+	if F.eventCrane ~= false and not sakura.unlocked() then
+		if not sakura.crane() then
+			return false
+		end
+		local shrine = sakura.shrine()
+		if not shrine then
+			return false
+		end
+		if bits.walkTo(shrine, 12) then
+			bits.stopWalking()
+			if bits.due("crane", 6) then
+				local ok, why = bits.ask(bits.NET.Sakura.REQUEST_RETURN_CRANE)
+				if ok then
+					bits.accepted("crane")
+					bits.notify("The tree is awake. Trees can be broken now.")
+				else
+					bits.refused("crane", 6)
+					bits.sayOnce("crane", "Could not wake the tree", tostring(why or "the server said no"))
+				end
+			end
+		end
+		return true
+	end
+
+	-- Nothing else happens outside a bloom.
+	local left = sakura.blooming()
+	if not left or not F.eventTrees or not sakura.unlocked() then
+		return false
+	end
+
+	local tree, gap = sakura.tree(here)
+	if not tree then
+		return false
+	end
+
+	-- Ten studs is the server's reach; stop a little inside it so a step does
+	-- not put us back outside between the check and the swing.
+	if gap > 8 then
+		bits.walkTo(select(2, pcall(function()
+			return tree:GetPivot().Position
+		end)), 8)
+		return true
+	end
+	bits.stopWalking()
+
+	-- 0.6s is the server's own cooldown. Asking faster is asking to be refused,
+	-- and this is a RemoteEvent so a refusal is silent and free to the server
+	-- and expensive to us.
+	if bits.due("bloom", 0.65) then
+		bits.ask(bits.NET.Sakura.REQUEST_HIT_TREE, tree)
+		sakura.hits = sakura.hits + 1
+	end
+	return true
+end
+
 local worth = { bits = nil }
 
 function worth.wire(bits)
@@ -2214,6 +2407,28 @@ function Module.Build(ctx)
 		VideoController = ok and type(module) == "table" and module or nil
 	end
 
+
+	-- Handed what it needs once, so nothing in the event costs a register in
+	-- Build. See MERIDIAN-DESIGN.
+	sakura.wire({
+		F = F,
+		NET = NET,
+		Save = Save,
+		ask = ask,
+		due = due,
+		accepted = accepted,
+		refused = refused,
+		sayOnce = sayOnce,
+		here = myPosition,
+		walkTo = walkTo,
+		stopWalking = function()
+			stopWalking()
+		end,
+		notify = function(text)
+			core:Notify("Meridian", text, 6)
+		end,
+	})
+
 	local function hushTheScreen()
 		if not VideoController or type(VideoController.Stop) ~= "function" then
 			return
@@ -2941,6 +3156,13 @@ function Module.Build(ctx)
 
 		-- Anything that holds the character still gets one nudge every few
 		-- seconds. On this map that is the treadmill and only the treadmill.
+		-- The event gets the legs first when it wants them. Two things steering
+		-- one character is the farm leaning on a wall, and a bloom lasts under
+		-- five minutes every half hour, so the eggs can wait.
+		if sakura.tick() then
+			return
+		end
+
 		watchForStuck()
 		if not core:Alive2() then
 			dropTarget()
@@ -4260,6 +4482,7 @@ function Module.Build(ctx)
 	local petsTab = tabGroup:Tab({ Name = "Pets", Image = "rbxassetid://10723415903" })
 	local progressTab = tabGroup:Tab({ Name = "Progress", Image = "rbxassetid://10734950309" })
 	local visualsTab = tabGroup:Tab({ Name = "Visuals", Image = "rbxassetid://10734898355" })
+	local eventTab = tabGroup:Tab({ Name = "Event", Image = "rbxassetid://10723345348" })
 	local playerTab = tabGroup:Tab({ Name = "Player", Image = "rbxassetid://10747373176" })
 
 	-- The Map tab, for the half of the audience that actually plays.
@@ -4283,6 +4506,7 @@ function Module.Build(ctx)
 	local progRight = progressTab:Section({ Side = "Right" })
 	local visualsLeft = visualsTab:Section({ Side = "Left" })
 	local visualsRight = visualsTab:Section({ Side = "Right" })
+	local eventLeft = eventTab:Section({ Side = "Left" })
 	local playerLeft = playerTab:Section({ Side = "Left" })
 	local playerRight = playerTab:Section({ Side = "Right" })
 
@@ -4956,6 +5180,63 @@ function Module.Build(ctx)
 	end)
 
 
+	------------------------------------------------------------------ the event
+
+	-- The Great Bloom. Trees for 285 seconds every half hour, a thousand
+	-- crystals a roll, and the roll can come back Divine.
+	eventLeft:Header({ Text = "Great Bloom" })
+
+	eventLeft:Toggle({
+		Name = "Wake The Tree",
+		Default = true,
+		Callback = function(state)
+			F.eventCrane = state
+		end,
+	}, "eventCrane")
+
+	eventLeft:Toggle({
+		Name = "Break Trees",
+		Default = true,
+		Callback = function(state)
+			F.eventTrees = state
+		end,
+	}, "eventTrees")
+
+	eventLeft:Toggle({
+		Name = "Take Crystals",
+		Default = true,
+		Callback = function(state)
+			F.eventCrystals = state
+		end,
+	}, "eventCrystals")
+
+	eventLeft:Button({
+		Name = "Wake The Tree Now",
+		Callback = function()
+			task.spawn(function()
+				local ok, why = ask(NET.Sakura.REQUEST_RETURN_CRANE)
+				core:Notify("Meridian", ok and "The tree is awake"
+					or ("Could not: " .. tostring(why or "the server said no")), 6)
+			end)
+		end,
+	})
+
+	eventLeft:Button({
+		Name = "Deposit And Mutate",
+		Callback = function()
+			task.spawn(function()
+				-- Deposit takes an amount. We count what we picked up rather
+				-- than trusting a balance we have not found a field for yet;
+				-- the server clamps it to what you actually have.
+				ask(NET.Sakura.REQUEST_DEPOSIT, sakura.crystals)
+				task.wait(0.5)
+				local ok, why, rolled = ask(NET.Sakura.REQUEST_MUTATE)
+				core:Notify("Meridian", ok and ("Mutated: " .. tostring(rolled or "done"))
+					or ("Could not mutate: " .. tostring(why or "the server said no")), 6)
+			end)
+		end,
+	})
+
 	------------------------------------------------------------- visuals · left
 
 	visualsLeft:Header({ Text = "Eggs" })
@@ -5218,6 +5499,7 @@ function Module.Build(ctx)
 			Progress = progressTab,
 			Visuals = visualsTab,
 			Player = playerTab,
+			Event = eventTab,
 		},
 		Default = stealTab,
 		Tips = Module.Tips,
