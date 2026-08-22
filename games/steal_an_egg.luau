@@ -3038,6 +3038,27 @@ function Module.Build(ctx)
 		if not currentTarget then
 			local best = rankedEggs()[1]
 			if not best then
+				-- Nothing on the map to walk to, so stand on the treadmill
+				-- rather than stand still. This used to be a bare return, and a
+				-- bare return is the farm doing nothing at all: no eggs, and no
+				-- Speed either, which is strictly worse than the thing it
+				-- refused to do. Watched in the four hour run - five minutes
+				-- with fifty-nine studs walked and Speed crawling at a
+				-- thirtieth of the treadmill rate.
+				--
+				-- The treadmill always pays. It is the floor, not a choice.
+				local spot = treadmillSpot()
+				if spot then
+					if not grinding then
+						grinding = true
+						core:Notify("Meridian", "Nothing on the map worth taking. On the treadmill.", 5)
+					end
+					grindReason = "nothing on the map to take"
+					if walkTo(spot, 3) then
+						stopWalking()
+					end
+					treadmill.mount()
+				end
 				return
 			end
 			currentTarget = best
