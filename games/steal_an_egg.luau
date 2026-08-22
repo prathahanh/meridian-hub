@@ -3312,9 +3312,26 @@ function Module.Build(ctx)
 		end
 	end)
 
+	-- Only when there is something waiting. This asked blind every ninety
+	-- seconds with no accepted() and no refused() behind it, so it never backed
+	-- off: forty requests an hour, nine hundred and sixty over a night, and
+	-- almost every one of them for nothing. The save says how much is pending,
+	-- so there is no question to ask most of the time.
 	core:Loop("offline", 10, function()
-		if F.baseOffline and due("offline", 90) then
-			ask(NET.OfflineAssets.REQUEST_REDEEM)
+		if not F.baseOffline then
+			return
+		end
+		local saved = select(2, pcall(Save.Get))
+		local pending = type(saved) == "table" and tonumber(saved.PendingOfflineMoney) or nil
+		if pending and pending <= 0 then
+			return
+		end
+		if due("offline", 90) then
+			if ask(NET.OfflineAssets.REQUEST_REDEEM) then
+				accepted("offline")
+			else
+				refused("offline", 90)
+			end
 		end
 	end)
 
@@ -3322,10 +3339,36 @@ function Module.Build(ctx)
 	-- pets
 	----------------------------------------------------------------------------
 
+	-- Only when the pen has changed. Equipping the best is the game's own
+	-- button and its answer only moves when a pet arrives or leaves, so a timer
+	-- calling it every eight seconds is three and a half thousand identical
+	-- requests over a night for one useful answer. The count of what is owned
+	-- and the count of what is out are enough to tell.
+	--
+	-- The base loop already calls this the moment something hatches, which is
+	-- the case that matters; this is the safety net for pets arriving any other
+	-- way.
 	core:Loop("pets", 6, function()
-		if F.petsEquipBest then
-			equipBest()
+		if not F.petsEquipBest then
+			return
 		end
+		local saved = select(2, pcall(Save.Get))
+		if type(saved) ~= "table" then
+			return
+		end
+		local owned = 0
+		for _ in pairs(saved.Inventory or {}) do
+			owned = owned + 1
+		end
+		-- On the worth table rather than a local beside the loop: Build is at
+		-- Luau's 200 register ceiling and one more local in there stops the
+		-- whole module compiling.
+		local signature = ("%d/%d"):format(owned, #(saved.EquippedAssets or {}))
+		if signature == worth.penWas then
+			return
+		end
+		worth.penWas = signature
+		equipBest()
 	end)
 
 	----------------------------------------------------------------------------
@@ -3442,17 +3485,62 @@ function Module.Build(ctx)
 	-- game: free gifts, lucky blocks, rebirth and codes. ask() looks the remote
 	-- up before calling and returns quietly, so the switches can stay on screen
 	-- without costing anything.
+	-- Backing off is right for something that might become claimable. It is
+	-- wrong for something you can look up.
+	--
+	-- Watched live: "index has been refused 12 times, leaving it alone for a
+	-- while" - because there was nothing to claim, which is the normal state.
+	-- The breaker then doubles its wait to a four hour ceiling, and since it can
+	-- only succeed by asking, a species hatched at midnight would have its Speed
+	-- reward sitting unclaimed until the morning.
+	--
+	-- The save carries both halves: Index is what has been hatched and
+	-- IndexClaimedCategories is what has been paid out. Comparing them costs
+	-- nothing and turns a blind timer into a request made only when there is
+	-- something to collect. `ready` is optional; the claims that cannot be
+	-- looked up keep the old behaviour.
 	local FREE = {
-		{ flag = "progIndex", key = "index", every = 120, action = NET.Index.REQUEST_CLAIM_ALL },
+		{
+			flag = "progIndex", key = "index", every = 120, action = NET.Index.REQUEST_CLAIM_ALL,
+			ready = function(saved)
+				local hatched = type(saved) == "table" and saved.Index or nil
+				local paid = type(saved) == "table" and saved.IndexClaimedCategories or nil
+				if type(hatched) ~= "table" or type(paid) ~= "table" then
+					return true
+				end
+				for species in pairs(hatched) do
+					if not paid[species] then
+						return true
+					end
+				end
+				return false
+			end,
+		},
 		{ flag = "progIndex", key = "indexEgg", every = 180, action = NET.Index.REQUEST_CLAIM_LIMITED_EGG_REWARD },
-		{ flag = "progGroup", key = "group", every = 300, action = NET.GroupReward.CLAIM_REWARD },
+		{ flag = "progGroup", key = "group", every = 300, action = NET.GroupReward.CLAIM_REWARD,
+			ready = function(saved)
+				return not (type(saved) == "table" and saved.ClaimedGroupReward == true)
+			end,
+		},
 		{ flag = "progGifts", key = "gifts", every = 120, action = NET.FreeGifts.REQUEST_CLAIM },
-		{ flag = "progLucky", key = "lucky", every = 90, action = NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM },
+		{ flag = "progLucky", key = "lucky", every = 90, action = NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM,
+			ready = function(saved)
+				local box = type(saved) == "table" and saved.LuckyBlockInventory or nil
+				if type(box) ~= "table" then
+					return true
+				end
+				return next(box) ~= nil
+			end,
+		},
 	}
 
 	core:Loop("progress", 8, function()
+		local saved = select(2, pcall(Save.Get))
 		for _, claim in ipairs(FREE) do
-			if F[claim.flag] ~= false and due(claim.key, claim.every) then
+			if F[claim.flag] ~= false
+				and (claim.ready == nil or claim.ready(saved) == true)
+				and due(claim.key, claim.every)
+			then
 				if ask(claim.action) then
 					accepted(claim.key)
 				else

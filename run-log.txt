@@ -1,1 +1,2 @@
 START money=11669136046 speed=12667160 base=5 mill=6 trail=RedTrail pets=31 out=12 income=2059947/s index=36
+5m money=12289156576 speed=13861560 income=2059947/s pets=31(14 fav) out=12 eggs=1(1 planted) index=36 map=45 walked=47 still=0s
