@@ -68,12 +68,8 @@ Module.Tips = {
 	["Treadmill When Eggs Are Poor"] = "When nothing on the map would move the needle, stands on the treadmill instead of walking fifteen hundred studs for an egg worth a rounding error.",
 	["Worth The Walk"] = "How much an egg has to add to what you already earn before it is worth the trip. A species you have never hatched always is, whatever it earns.",
 	["Treadmill For The Next Area"] = "When the next area is one sitting away on the treadmill, goes and stands on it until you can get in, then goes back to farming.",
-	["Auto Rebirth"] = "Rebirths as soon as the game lets you.",
-	["Rebirth Now"] = "Rebirths, right now.",
 	["Claim Index"] = "Collects every index reward you have earned, including the limited egg one.",
 	["Claim Group Reward"] = "Takes the reward for being in the group, if you are in it.",
-	["Auto Free Gifts"] = "Takes the free gifts as they come up.",
-	["Auto Lucky Blocks"] = "Opens lucky blocks as they are stored.",
 	["Redeem Codes"] = "Tries every code the game currently has active.",
 	["Egg ESP"] = "Draws every egg on the map through walls, with what it is worth.",
 	["Colour By"] = "Worth shades from grey to green against the best egg on the map. Rarity uses the game's own colours. Index paints anything you have never hatched gold and everything else grey.",
@@ -3674,16 +3670,6 @@ function Module.Build(ctx)
 				return worth.inGroup == true
 			end,
 		},
-		{ flag = "progGifts", key = "gifts", every = 120, action = NET.FreeGifts.REQUEST_CLAIM },
-		{ flag = "progLucky", key = "lucky", every = 90, action = NET.LuckyBlock.REQUEST_STORED_BLOCK_OPEN_CLAIM,
-			ready = function(saved)
-				local box = type(saved) == "table" and saved.LuckyBlockInventory or nil
-				if type(box) ~= "table" then
-					return true
-				end
-				return next(box) ~= nil
-			end,
-		},
 	}
 
 	core:Loop("progress", 8, function()
@@ -3704,15 +3690,6 @@ function Module.Build(ctx)
 				else
 					refused(claim.key, claim.every)
 				end
-			end
-		end
-		if F.progRebirth and due("rebirth", 120) then
-			if ask(NET.Rebirth.REQUEST_REBIRTH) then
-				task.wait(0.5)
-				ask(NET.Rebirth.REQUEST_REBIRTH_COMMIT)
-				accepted("rebirth")
-			else
-				refused("rebirth", 120)
 			end
 		end
 	end)
@@ -4891,28 +4868,6 @@ function Module.Build(ctx)
 		end,
 	}, "stealShare")
 
-	progLeft:Divider()
-
-	progLeft:Header({ Text = "Rebirth" })
-
-	progLeft:Toggle({
-		Name = "Auto Rebirth",
-		Default = false,
-		Callback = function(state)
-			F.progRebirth = state
-		end,
-	}, "progRebirth")
-
-	progLeft:Button({
-		Name = "Rebirth Now",
-		Callback = function()
-			task.spawn(function()
-				ask(NET.Rebirth.REQUEST_REBIRTH)
-				ask(NET.Rebirth.REQUEST_REBIRTH_COMMIT)
-			end)
-		end,
-	})
-
 	----------------------------------------------------------- progress · right
 
 	progRight:Header({ Text = "Free Things" })
@@ -4926,28 +4881,12 @@ function Module.Build(ctx)
 	}, "progIndex")
 
 	progRight:Toggle({
-		Name = "Auto Free Gifts",
-		Default = true,
-		Callback = function(state)
-			F.progGifts = state
-		end,
-	}, "progGifts")
-
-	progRight:Toggle({
 		Name = "Claim Group Reward",
 		Default = true,
 		Callback = function(state)
 			F.progGroup = state
 		end,
 	}, "progGroup")
-
-	progRight:Toggle({
-		Name = "Auto Lucky Blocks",
-		Default = true,
-		Callback = function(state)
-			F.progLucky = state
-		end,
-	}, "progLucky")
 
 	--------------------------------------------------------------- the index
 	--
