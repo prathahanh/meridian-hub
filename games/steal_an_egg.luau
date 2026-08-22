@@ -318,6 +318,64 @@ end
 -- The egg farm and this share one character. Whichever of them is walking has
 -- to be the only one walking, so this runs first and the farm tick asks it
 -- whether it is busy before doing anything of its own.
+-- Is this species event-only?
+--
+-- Both event egg directories ship an IsEventCategory of their own, so this is
+-- the game's own answer rather than a list to keep in step with it.
+--
+-- It matters more than any other test in this file. The demonic egg drops a
+-- Gargoyle at twelve million a second and a Minotaur at forty, against a pen
+-- earning five and a half million in total, and an Archdemon Dragon is one and
+-- a quarter billion a second with twelve million Speed of index behind it.
+-- One of these is worth more than a night of ordinary farming, so no threshold
+-- gets a vote on whether to go and take it.
+function sakura.eventEgg(category)
+	if not category then
+		return false
+	end
+	local bits = sakura.bits
+	if not bits then
+		return false
+	end
+	if sakura.eventCats == nil then
+		sakura.eventCats = {}
+		for _, name in ipairs({ "DragonEgg", "AdminAbuseEgg" }) do
+			local ok, dir = pcall(require, bits.Directory:WaitForChild(name))
+			if ok and type(dir) == "table" and type(dir.DropTable) == "table" then
+				for key, entry in pairs(dir.DropTable) do
+					local species = type(entry) == "table" and entry[1] or key
+					if species then
+						sakura.eventCats[tostring(species)] = true
+					end
+				end
+			end
+		end
+	end
+	return sakura.eventCats[tostring(category)] == true
+end
+
+-- Where a carried dragon has to go, if it is a dragon and the event is on.
+--
+-- Returns nil in every other case, so the farm's own homeTarget falls through
+-- to the plot exactly as before.
+function sakura.nest()
+	local ws = game:GetService("Workspace")
+	if ws:GetAttribute("Event_DragonEggEvent") ~= true then
+		return nil
+	end
+	local bits = sakura.bits
+	if not bits or bits.F.eventDragon == false then
+		return nil
+	end
+	local carrying = bits.carriedCategory and bits.carriedCategory() or nil
+	if carrying ~= "Baby Aurora Dragon" then
+		return nil
+	end
+	local objects = ws:FindFirstChild("__OBJECTS")
+	local hitbox = objects and objects:FindFirstChild("DeliveryHitbox")
+	return hitbox and hitbox:IsA("BasePart") and hitbox.Position or nil
+end
+
 function sakura.tick()
 	local bits = sakura.bits
 	if not bits then
@@ -1693,7 +1751,12 @@ function Module.Build(ctx)
 				for _, area in ipairs(tiers) do
 					local odds = losses.odds(area.id)
 					for _, egg in ipairs(byArea[area.id] or {}) do
-						if egg.fresh and odds >= 0.5 and egg.reward * odds > awayReward then
+						-- An event species goes regardless of the odds. Losing a
+						-- Gargoyle to a guard costs one trip; not going for it
+						-- costs the whole event.
+						local mustGo = F.eventChase ~= false
+							and sakura.eventEgg(egg.record and egg.record.AssetCategory)
+						if (egg.fresh and odds >= 0.5 or mustGo) and egg.reward * odds > awayReward then
 							away, awayReward = area.id, egg.reward * odds
 						end
 					end
@@ -2414,6 +2477,19 @@ function Module.Build(ctx)
 		F = F,
 		NET = NET,
 		Save = Save,
+		Directory = Directory,
+		carriedCategory = function()
+			local uid = carriedUid()
+			if not uid then
+				return nil
+			end
+			for _, record in ipairs(cachedSnapshot().Records) do
+				if record.Uid == uid then
+					return record.AssetCategory
+				end
+			end
+			return nil
+		end,
 		ask = ask,
 		due = due,
 		accepted = accepted,
@@ -2562,6 +2638,11 @@ function Module.Build(ctx)
 			return false
 		end
 		if egg.fresh then
+			return true
+		end
+		-- An event species is never weighed against anything. See
+		-- sakura.eventEgg for the numbers.
+		if F.eventChase ~= false and sakura.eventEgg(egg.record and egg.record.AssetCategory) then
 			return true
 		end
 		local share = (tonumber(F.stealShare) or 2) / 100 * (times or 1)
@@ -2759,6 +2840,16 @@ function Module.Build(ctx)
 	local homeSpot = nil
 
 	local function homeTarget()
+		-- A dragon does not go home, it goes to the nest.
+		--
+		-- The dragon event asks you to carry Baby Aurora Dragons to a delivery
+		-- hitbox rather than plant them. Ten of them buys a Dragon's Egg, and
+		-- the scale of what hatches grows 0.42 with every return, so the tenth
+		-- one is worth several times the first.
+		local nest = sakura.nest()
+		if nest then
+			return nest
+		end
 		local data = plotData()
 		local pad = data and data.PetArea
 		if not pad or not pad:IsA("BasePart") then
@@ -5209,6 +5300,44 @@ function Module.Build(ctx)
 			F.eventCrystals = state
 		end,
 	}, "eventCrystals")
+
+	eventLeft:Divider()
+	eventLeft:Header({ Text = "The Other Two" })
+
+	eventLeft:Toggle({
+		Name = "Return Dragons",
+		Default = true,
+		Callback = function(state)
+			F.eventDragon = state
+		end,
+	}, "eventDragon")
+
+	eventLeft:Toggle({
+		Name = "Chase Event Eggs",
+		Default = true,
+		Callback = function(state)
+			F.eventChase = state
+		end,
+	}, "eventChase")
+
+	-- Shouting when one starts, because all three are on the server's clock and
+	-- none of them wait for you. A demonic egg is worth more than a night of
+	-- ordinary farming and it is gone when somebody else takes it.
+	core:Loop("events", 3, function()
+		for name, label in pairs({
+			Event_GreatBloom = "The Great Bloom has started. Trees are up.",
+			Event_DragonEggEvent = "A dragon has descended.",
+			Event_AdminAbuse = "A demonic egg has spawned.",
+		}) do
+			local on = Workspace:GetAttribute(name) == true
+			if on and not sakura.said[name] then
+				sakura.said[name] = true
+				core:Notify("Meridian", label, 10)
+			elseif not on then
+				sakura.said[name] = nil
+			end
+		end
+	end)
 
 	eventLeft:Button({
 		Name = "Wake The Tree Now",
