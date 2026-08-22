@@ -2121,6 +2121,12 @@ function UI.Apply(core, base, window, tips)
 	polishSidebar(core, base)
 	installSearch(core, base)
 	growGlobeButton(core, base)
+	-- Written, never called. The game module has been computing core.Headline
+	-- once a second the whole time and nothing has ever displayed it, which is
+	-- why watching the farm meant reading a log instead of the top bar. It
+	-- hides itself when there is nothing to say, so it costs nothing on a tab
+	-- where nothing is running.
+	headlineReadout(core, base)
 	polishNotifications(core, base.Parent)
 	task.spawn(brandMark, core, base)
 	slidingIndicator(core, base)

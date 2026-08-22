@@ -295,9 +295,29 @@ function worth.shop(data)
 		end
 	end
 
+	-- A base upgrade buys one more pet slot, and one more slot earns roughly
+	-- what the weakest pet already out earns. That is a payback time, and past
+	-- the early levels it is a terrible one: base 6 costs fifty billion against
+	-- a thirteenth pet worth about 73K a second, which pays for itself in a
+	-- hundred and ninety hours.
+	--
+	-- Cheapest first would buy it anyway, ahead of a treadmill upgrade that
+	-- doubles the Speed rate, because it happens to cost less. So the slot has
+	-- to justify itself on time rather than on price: six hours to pay for
+	-- itself or it waits until the pen has grown into it.
 	local step = worth.nextBase(data)
 	if step and step.afford then
-		offer("base", step.cost, nil, ("Base %d"):format(step.level))
+		local rows = worth.pets(data)
+		local weakest = 0
+		for _, row in ipairs(rows) do
+			if row.worn then
+				weakest = row.rate
+			end
+		end
+		local payback = weakest > 0 and (step.cost / weakest) or math.huge
+		if payback <= 21600 then
+			offer("base", step.cost, nil, ("Base %d"):format(step.level))
+		end
 	end
 
 	local level = tonumber(data.TreadmillUpgradeLevel)
