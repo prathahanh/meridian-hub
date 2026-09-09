@@ -340,7 +340,7 @@ function sakura.eventEgg(category)
 	if sakura.eventCats == nil then
 		sakura.eventCats = {}
 		for _, name in ipairs({ "DragonEgg", "AdminAbuseEgg" }) do
-			local ok, dir = pcall(require, bits.Directory:WaitForChild(name))
+			local ok, dir = pcall(require, bits.Directory:FindFirstChild(name))
 			if ok and type(dir) == "table" and type(dir.DropTable) == "table" then
 				for key, entry in pairs(dir.DropTable) do
 					local species = type(entry) == "table" and entry[1] or key
@@ -630,6 +630,296 @@ function worth.shop(data)
 	return best
 end
 
+--------------------------------------------------------------------------------
+-- the September 2026 restructure
+--------------------------------------------------------------------------------
+
+-- Every module this file used to require moved, and the hub did not fail, it
+-- hung: Build opened with ReplicatedStorage:WaitForChild("Library"), and
+-- WaitForChild has no timeout, so the window never drew and nothing said why.
+--
+--   Library                  ->  Shared
+--   Library.Client           ->  Client, promoted to the top level
+--   Client.Save              ->  Shared.Save
+--   Directory                ->  Data
+--   Library.Util.AssetGenerationUtil -> Shared.Util.AssetEarnings
+--   Library.Util.AreaEggResetTimeUtil -> Shared.Util.AreaEggCycle
+--
+-- EggCmds, PlotCmds, Network and Constants.NETWORK_MAP stopped existing
+-- outright. What replaced all four is one table of remote Instances at
+-- Shared.Remotes, keyed by system and then by a new name for every command,
+-- and the new names share nothing with the old ones: SELL_ALL_ASSETS is now
+-- PetSatchel.SellEveryPet, REQUEST_BASE_UPGRADE is Homestead.AskBaseTierRaise,
+-- the whole Sakura system is Bloomery, and Index is Codex.
+--
+-- The farm logic below this line was right before the update and is still
+-- right, so none of it changes. This rebuilds the four things it expects on top
+-- of what the game now has, and it uses FindFirstChild throughout: a missing
+-- path has to be a message, never a hang.
+
+local port = {}
+
+-- old EggCmds method -> Remotes.EggWorld member
+port.EGG = {
+	RequestAreaEggSnapshot = "AskFieldEggSnapshot",
+	GetAreaEggSnapshot = "AskLiveSnapshot",
+	GetAreaEggRecord = "AskEggRecord",
+	RequestPlaceEgg = "AskPlaceEgg",
+	RequestEquipTool = "AskWearTool",
+	RequestCarryAreaEgg = "AskFieldEggCarry",
+	RequestHatchEgg = "AskHatch",
+	RequestCompleteHatchEgg = "AskFinishHatch",
+	RequestSkipGrowth = "AskSkipGrowth",
+}
+
+-- old NETWORK_MAP entry -> { system, member }
+port.NET_MAP = {
+	AssetInventory = {
+		SELL_ALL_ASSETS = { "PetSatchel", "SellEveryPet" },
+		SET_FAVORITE = { "PetSatchel", "WriteFavourite" },
+	},
+	Backpack = {
+		EQUIP_BEST = { "Haul", "WearBest" },
+		SET_AUTO_SELL_STATE = { "Haul", "WriteAutoSell" },
+	},
+	FuseMachine = {
+		COMPLETE_REVEAL = { "Fusery", "FinishReveal" },
+		INSERT_MOB = { "Fusery", "LoadPet" },
+		START_FUSE = { "Fusery", "BeginFuse" },
+	},
+	GroupReward = {
+		CLAIM_REWARD = { "GroupPerk", "RedeemPerk" },
+	},
+	Index = {
+		REQUEST_CLAIM_ALL = { "Codex", "AskRedeemAll" },
+		REQUEST_CLAIM_LIMITED_EGG_REWARD = { "Codex", "AskRedeemLimitedEgg" },
+		REQUEST_EQUIP_AREA_BAT = { "Codex", "AskWearFieldBat" },
+	},
+	OfflineAssets = {
+		REQUEST_REDEEM = { "AwayEarnings", "AskCollect" },
+	},
+	Plots = {
+		REQUEST_BASE_UPGRADE = { "Homestead", "AskBaseTierRaise" },
+	},
+	Sakura = {
+		REQUEST_COLLECT_CRYSTAL = { "Bloomery", "AskGatherPetal" },
+		REQUEST_DEPOSIT = { "Bloomery", "AskHandoff" },
+		REQUEST_HIT_TREE = { "Bloomery", "AskStrikeTree" },
+		REQUEST_MUTATE = { "Bloomery", "AskMutate" },
+		REQUEST_RETURN_CRANE = { "Bloomery", "AskCraneReturn" },
+	},
+	Trails = {
+		REQUEST_PURCHASE = { "Trailwear", "AskPurchase" },
+		REQUEST_SELECT = { "Trailwear", "AskChoose" },
+	},
+	Treadmills = {
+		ACTIVE_TREADMILL_EVENT = { "Treadmill", "AssignedBeltShifted" },
+		REQUEST_EQUIP_STATIC = { "Treadmill", "AskWearStill" },
+		REQUEST_UNEQUIP = { "Treadmill", "AskDoff" },
+		REQUEST_UPGRADE = { "Treadmill", "AskTierRaise" },
+	},
+}
+
+port.missing = {}
+
+function port.note(what)
+	port.missing[#port.missing + 1] = what
+end
+
+function port.grab(parent, name)
+	local found = parent and parent:FindFirstChild(name)
+	if not found then
+		port.note(((parent and parent.Name) or "?") .. "." .. name)
+	end
+	return found
+end
+
+-- Client and Shared traded modules in the update and neither list is stable,
+-- so the loose ones are found by name across both rather than by path.
+function port.module(name)
+	local RS = game:GetService("ReplicatedStorage")
+	local Shared = RS:FindFirstChild("Shared")
+	local roots = {
+		RS:FindFirstChild("Client"),
+		Shared,
+		Shared and Shared:FindFirstChild("Util"),
+		Shared and Shared:FindFirstChild("Modules"),
+	}
+	for _, root in ipairs(roots) do
+		local found = root and root:FindFirstChild(name, true)
+		if found and found:IsA("ModuleScript") then
+			local ok, value = pcall(require, found)
+			if ok then return value end
+			port.note(name .. " failed to load")
+			return nil
+		end
+	end
+	port.note("module " .. name)
+	return nil
+end
+
+function port.load(parent, name)
+	local mod = port.grab(parent, name)
+	if not mod then return nil end
+	local ok, value = pcall(require, mod)
+	if not ok then
+		port.note(name .. " failed to load: " .. tostring(value))
+		return nil
+	end
+	return value
+end
+
+-- one call for a remote, whichever kind it turns out to be
+function port.send(remote, ...)
+	if typeof(remote) ~= "Instance" then return false, "no remote" end
+	if remote:IsA("RemoteFunction") then
+		return true, remote:InvokeServer(...)
+	end
+	remote:FireServer(...)
+	return true, true
+end
+
+function port.wire(RS)
+	port.missing = {}
+
+	local Shared = port.grab(RS, "Shared")
+	local Data = port.grab(RS, "Data")
+	local Util = Shared and Shared:FindFirstChild("Util")
+	local Globals = Shared and Shared:FindFirstChild("Globals")
+
+	local Remotes = Shared and port.load(Shared, "Remotes") or {}
+	if type(Remotes) ~= "table" then Remotes = {} end
+
+	local Save = (Shared and port.load(Shared, "Save"))
+		or { Get = function() return nil end }
+
+	-- NET, except every leaf is now the remote itself rather than a name
+	local NET = {}
+	for system, commands in pairs(port.NET_MAP) do
+		local bucket = {}
+		local live = Remotes[system]
+		for oldName, spec in pairs(commands) do
+			local remote = type(live) == "table" and live[spec[2]] or nil
+			if remote == nil then
+				port.note(("%s.%s -> %s.%s"):format(system, oldName, spec[1], spec[2]))
+			end
+			bucket[oldName] = remote
+		end
+		NET[system] = bucket
+	end
+
+	-- EggCmds, rebuilt as plain functions over Remotes.EggWorld
+	local EW = Remotes.EggWorld
+	local EggCmds = {}
+	if type(EW) == "table" then
+		for oldName, newName in pairs(port.EGG) do
+			local remote = EW[newName]
+			if remote then
+				EggCmds[oldName] = function(...)
+					local ok, value = port.send(remote, ...)
+					if not ok then return nil end
+					return value
+				end
+			else
+				port.note("EggWorld." .. newName)
+			end
+		end
+
+		-- the carry signal the snapshot listens on
+		EggCmds.AreaEggCarryStateChanged = EW.FieldEggCarry
+		EggCmds.AreaEggShifted = EW.FieldEggShifted
+		EggCmds.AreaEggGone = EW.FieldEggGone
+
+		-- the pen, which used to be its own call and is now a filter over the
+		-- live snapshot. Unverified against a stocked base: this account owns
+		-- nothing yet.
+		EggCmds.GetOwnerRuntimeRecords = function(userId)
+			local ok, snap = port.send(EW.AskLiveSnapshot)
+			if not ok or type(snap) ~= "table" then return nil end
+			local records = snap.Records or snap
+			if type(records) ~= "table" then return nil end
+			if userId == nil then return records end
+			local mine = {}
+			for _, record in pairs(records) do
+				if type(record) == "table" then
+					local owner = record.OwnerUserId or record.UserId or record.Owner
+					if owner == nil or owner == userId then
+						mine[#mine + 1] = record
+					end
+				end
+			end
+			return mine
+		end
+	end
+
+	-- readiness moved onto the record itself
+	local EggRecords = Util and port.load(Util, "EggRecords")
+	if type(EggRecords) == "table" and type(EggRecords.IsGrown) == "function" then
+		EggCmds.IsLocalEggReady = function(uid)
+			local record = EggCmds.GetAreaEggRecord and EggCmds.GetAreaEggRecord(uid)
+			if type(record) ~= "table" then return nil end
+			local ok, grown = pcall(EggRecords.IsGrown, record)
+			return ok and grown or nil
+		end
+	end
+
+	-- PlotCmds. GetPlotData has a remote; the bounds test does not, so it is
+	-- geometry now, and it answers nil rather than guessing when it cannot tell.
+	local Geometry = Util and port.load(Util, "GuardAreaGeometry")
+	local Homestead = Remotes.Homestead
+	local PlotCmds = {
+		GetPlotData = function()
+			if type(Homestead) ~= "table" or not Homestead.AskState then return nil end
+			local ok, state = port.send(Homestead.AskState)
+			return ok and state or nil
+		end,
+		IsWorldPositionWithinLocalPlotBounds = function(position)
+			if type(Geometry) ~= "table" or type(Geometry.IsWithinFootprint) ~= "function" then
+				return nil
+			end
+			local ok, inside = pcall(Geometry.IsWithinFootprint, position)
+			return ok and inside or nil
+		end,
+	}
+
+	-- Network, kept only because the rest of the file speaks it
+	local Network = {
+		Invoke = function(remote, ...)
+			local ok, value = port.send(remote, ...)
+			if not ok then error("no remote", 0) end
+			return value
+		end,
+		Fire = function(remote, ...)
+			local ok = port.send(remote, ...)
+			if not ok then error("no remote", 0) end
+			return true
+		end,
+		Fired = function(remote)
+			if typeof(remote) == "Instance" and remote:IsA("RemoteEvent") then
+				return remote.OnClientEvent
+			end
+			return nil
+		end,
+	}
+
+	local Constants = Globals and port.load(Globals, "Constants") or {}
+	local AssetGen = Util and port.load(Util, "AssetEarnings") or {}
+
+	-- the two rate calls this file makes, under their old names
+	if type(AssetGen) == "table" then
+		AssetGen.GetRate = AssetGen.GetRate or AssetGen.RatePerSecond
+		AssetGen.GetBaseRateMutationOnly =
+			AssetGen.GetBaseRateMutationOnly or AssetGen.MutationOnlyRatePerSecond
+	end
+
+	local Assets = Data and port.load(Data, "Assets") or {}
+	local Areas = Data and port.load(Data, "Areas") or {}
+	local Guards = Data and port.load(Data, "Guards") or {}
+
+	return Data, EggCmds, PlotCmds, Save, Network, NET,
+		Constants, AssetGen, Assets, Areas, Guards
+end
+
 function Module.Build(ctx)
 	journal.entries = {}
 	local core, tabGroup = ctx.core, ctx.TabGroup
@@ -641,22 +931,14 @@ function Module.Build(ctx)
 	-- the game's own modules
 	----------------------------------------------------------------------------
 
-	local Library = ReplicatedStorage:WaitForChild("Library")
-	local Client = Library:WaitForChild("Client")
-	local Directory = ReplicatedStorage:WaitForChild("Directory")
+	-- Eleven values against the old block's thirteen locals, which buys back two
+	-- registers; Build has been against Luau's 200 ceiling since June.
+	local Directory, EggCmds, PlotCmds, Save, Network, NET,
+		Constants, AssetGen, Assets, Areas, Guards = port.wire(ReplicatedStorage)
 
-	local EggCmds = require(Client:WaitForChild("EggCmds"))
-	local PlotCmds = require(Client:WaitForChild("PlotCmds"))
-	local Save = require(Client:WaitForChild("Save"))
-	local Network = require(Client:WaitForChild("Network"))
-
-	local Constants = require(Library:WaitForChild("Globals"):WaitForChild("Constants"))
-	local NET = Constants.NETWORK_MAP
-
-	local AssetGen = require(Library:WaitForChild("Util"):WaitForChild("AssetGenerationUtil"))
-	local Assets = require(Directory:WaitForChild("Assets"))
-	local Areas = require(Directory:WaitForChild("Areas"))
-	local Guards = require(Directory:WaitForChild("Guards"))
+	if #port.missing > 0 then
+		journal.note("port: " .. table.concat(port.missing, ", "))
+	end
 
 	----------------------------------------------------------------------------
 	-- what an egg is worth
@@ -875,7 +1157,7 @@ function Module.Build(ctx)
 		end
 	end
 
-	local SpeedPower = require(Client:WaitForChild("SpeedPowerProjection"))
+	local SpeedPower = port.module("SpeedPowerProjection") or {}
 
 	-- The way in, and the reason a farm can stand two studs from an egg for
 	-- twenty seconds without taking it.
@@ -942,7 +1224,7 @@ function Module.Build(ctx)
 	local GuardConfig = Guards.Directory or Guards
 	local WAKING = 0.63
 	do
-		local ok, policy = pcall(require, ReplicatedStorage.Library.Modules.GuardAreas.GuardChasePolicy)
+		local ok, policy = pcall(require, ReplicatedStorage.Shared.Modules.GuardAreas.GuardChasePolicy)
 		if ok and type(policy) == "table" and type(policy.GetWakingDuration) == "function" then
 			local fine, value = pcall(policy.GetWakingDuration)
 			if fine and tonumber(value) then
@@ -1029,10 +1311,10 @@ function Module.Build(ctx)
 	-- has none left.
 	worth.wire({
 		AssetGen = AssetGen,
-		Bases = require(Directory:WaitForChild("Bases")),
-		Treadmills = require(Directory:WaitForChild("Treadmills")),
+		Bases = require(Directory.Bases),
+		Treadmills = require(Directory.Treadmills),
 		Trails = (function()
-			local list = require(Directory:WaitForChild("Trails"))
+			local list = require(Directory.Trails)
 			return list.Directory or list
 		end)(),
 	})
@@ -1264,7 +1546,6 @@ function Module.Build(ctx)
 	--
 	-- So nothing is called by name alone. Find the remote, use the method it
 	-- actually is, and if it is not there, do nothing and say so.
-	local NetworkFolder = ReplicatedStorage:FindFirstChild("Network")
 
 	-- Nothing in the farm tick may wait on the server, and this is not theory.
 	--
@@ -1309,33 +1590,28 @@ function Module.Build(ctx)
 		return state.value ~= false, state.reason
 	end
 
+	-- Since the restructure NET hands back the remote itself rather than a
+	-- name, so the lookup that used to poison the network layer cannot happen:
+	-- a missing command is nil here and nil is refused on the first line.
 	local function ask(action, ...)
-		if type(action) ~= "string" then
-			return false, "no such action"
+		if typeof(action) ~= "Instance" then
+			return false, "this game has no such action"
 		end
-		local folder = NetworkFolder
-		if not folder or not folder.Parent then
-			folder = ReplicatedStorage:FindFirstChild("Network")
-			NetworkFolder = folder
-		end
-		local remote = folder and folder:FindFirstChild(action)
-		if not remote then
-			return false, "this game has no " .. action
-		end
-		if remote:IsA("RemoteFunction") then
+		local name = action.Name
+		if action:IsA("RemoteFunction") then
 			local ok, reason = answerWithin(Network.Invoke, action, ...)
-			journal.note(("%s %s"):format(action, ok and "ok" or ("refused: " .. tostring(reason))))
+			journal.note(("%s %s"):format(name, ok and "ok" or ("refused: " .. tostring(reason))))
 			return ok, reason
 		end
-		if remote:IsA("RemoteEvent") then
+		if action:IsA("RemoteEvent") then
 			local ok, err = pcall(Network.Fire, action, ...)
-			journal.note(("%s %s"):format(action, ok and "fired" or ("failed: " .. tostring(err))))
+			journal.note(("%s %s"):format(name, ok and "fired" or ("failed: " .. tostring(err))))
 			if ok then
 				return true
 			end
 			return false, tostring(err)
 		end
-		return false, action .. " is a " .. remote.ClassName
+		return false, name .. " is a " .. action.ClassName
 	end
 
 	----------------------------------------------------------------------------
@@ -1405,7 +1681,7 @@ function Module.Build(ctx)
 
 	function cycle.reach()
 		if cycle.util == nil then
-			local ok, mod = pcall(require, ReplicatedStorage.Library.Util.AreaEggResetTimeUtil)
+			local ok, mod = pcall(require, ReplicatedStorage.Shared.Util.AreaEggCycle)
 			cycle.util = ok and mod or false
 		end
 		return cycle.util or nil
@@ -2465,7 +2741,7 @@ function Module.Build(ctx)
 	local VideoController = nil
 	do
 		local ok, module = pcall(function()
-			return require(Client:WaitForChild("TreadmillVideoController", 5))
+			return port.module("TreadmillVideoController")
 		end)
 		VideoController = ok and type(module) == "table" and module or nil
 	end
@@ -3809,7 +4085,7 @@ function Module.Build(ctx)
 		-- for the hours it takes to save three billion is the exact habit that
 		-- gets accounts removed.
 		if F.speedUpgrade then
-			local shop = require(ReplicatedStorage.Directory.Treadmills)
+			local shop = require(ReplicatedStorage.Data.Treadmills)
 			local saved = select(2, pcall(Save.Get))
 			local level = type(saved) == "table" and tonumber(saved.TreadmillUpgradeLevel) or nil
 			local okNext, next = false, nil
@@ -3836,7 +4112,7 @@ function Module.Build(ctx)
 		-- the other half of the same sum and nothing was buying it either.
 		-- Red is 4x, Galaxy 5x, Secret 7x, Eternal 10x, Divine 14x.
 		if F.speedTrail then
-			local shop = require(ReplicatedStorage.Directory.Trails)
+			local shop = require(ReplicatedStorage.Data.Trails)
 			local saved = select(2, pcall(Save.Get))
 			if type(saved) == "table" then
 				local owned = saved.TrailInventory or {}
@@ -3933,7 +4209,7 @@ function Module.Build(ctx)
 				if type(hatched) ~= "table" then
 					return true
 				end
-				local ok, limited = pcall(require, Directory:WaitForChild("LimitedEgg"))
+				local ok, limited = pcall(require, Directory:FindFirstChild("LimitedEgg"))
 				local drops = ok and type(limited) == "table" and limited.DropTable or nil
 				if type(drops) ~= "table" then
 					return true
