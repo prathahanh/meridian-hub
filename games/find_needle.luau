@@ -43,6 +43,7 @@ Module.Tips = {
 	["Sell When Full"] = "Carries the bag to the cow the moment it will not hold any more. Off means it keeps working and stops earning.",
 	["Buy Upgrades"] = "Spends the money it earns on the thing that pays for itself soonest, and leaves the rest alone.",
 	["Spend On"] = "Which ladder it is allowed to climb. Everything lets it choose between them on payback.",
+	["Pays Back Within"] = "How long an upgrade has to earn its price back before it is worth buying. Seconds. Turn it up and it will buy things that only pay off on a long round.",
 	["Keep In Reserve"] = "Money it will not spend, so there is always something left for the thing you want to buy yourself.",
 	["Highlight The Needle"] = "Outlines the needle once the game has told you where it is. Nothing can point at it before that, because the server does not say.",
 	["Tracer To The Needle"] = "Draws a line from you to the needle while it is showing.",
@@ -237,12 +238,22 @@ function ladder.state()
 	return state
 end
 
--- The cheapest thing that pays for itself, or nothing.
-function ladder.best(cash, allow)
+-- The affordable thing with the best payback, or nothing.
+--
+-- `ceiling` is what stops this being cheapest-first wearing a suit. At bag 100
+-- the next bag upgrade costs $5 and buys 0.05 hay a second, which is a payback
+-- of ten thousand seconds; the pitchfork costs $8 and buys 5.96, which is a
+-- hundred and thirty-four. Buying the cheap one first is not just worse value,
+-- it takes the money that was five bags away from the good one.
+--
+-- Steal An Egg paid for this: three ladders with no order between them, and
+-- whichever timer came round first spent everything.
+function ladder.best(cash, allow, ceiling)
 	local bits = ladder.bits
 	if not bits or type(cash) ~= "number" then
 		return nil
 	end
+	ceiling = tonumber(ceiling) or 600
 	local player = bits.player
 	local Config = bits.Config
 	local capacity = tonumber(player:GetAttribute("HayCapacity")) or 25
@@ -256,17 +267,29 @@ function ladder.best(cash, allow)
 	local nowPer = forked and (swing / math.max(scoop, 1)) or perPick
 	local now = ladder.rate(capacity, nowPer)
 
-	local best = nil
+	local best, saving = nil, nil
 	local function offer(kind, id, label, cost, after)
 		cost = tonumber(cost)
-		if not cost or cost > cash or after <= now then
+		if not cost or after <= now then
 			return
 		end
 		-- Payback in seconds: what it costs, over what it adds. Hay is a cent,
 		-- so a gain of one hay a second is a cent a second.
 		local payback = cost / ((after - now) * Config.HAY_VALUE)
+		if payback > ceiling then
+			return
+		end
+		local want = { kind = kind, id = id, label = label, cost = cost, payback = payback }
+		if cost > cash then
+			-- Worth having but not yet affordable. Remembered so the caller can
+			-- say it is saving rather than say nothing at all.
+			if not saving or payback < saving.payback then
+				saving = want
+			end
+			return
+		end
 		if not best or payback < best.payback then
-			best = { kind = kind, id = id, label = label, cost = cost, payback = payback }
+			best = want
 		end
 	end
 
@@ -300,7 +323,13 @@ function ladder.best(cash, allow)
 		end
 	end
 
-	return best
+	-- Saving beats spending when the thing being saved for is much better. Bag
+	-- 150 at ten thousand seconds and the pitchfork at a hundred and thirty-four
+	-- are not close, and taking the affordable one delays the good one.
+	if saving and best and saving.payback * 4 < best.payback then
+		return nil, saving
+	end
+	return best, saving
 end
 
 function ladder.buy(want)
@@ -641,10 +670,18 @@ function farm.spend()
 		return
 	end
 	local reserve = tonumber(bits.F.buyReserve) or 0
-	local want = ladder.best(cash - reserve, bits.F.buyAllow)
+	local want, saving = ladder.best(cash - reserve, bits.F.buyAllow, bits.F.buyPayback)
 	if not want then
+		-- Say what it is holding out for, once, rather than look idle while the
+		-- money piles up.
+		if saving and farm.savingFor ~= saving.id then
+			farm.savingFor = saving.id
+			bits.core:Notify(Module.Name,
+				("Saving for the %s, $%.2f"):format(saving.label, saving.cost), 5)
+		end
 		return
 	end
+	farm.savingFor = nil
 	if ladder.buy(want) then
 		bits.core:Notify(Module.Name,
 			("%s, $%.2f, pays for itself in %d seconds"):format(want.label, want.cost, want.payback), 5)
@@ -1023,6 +1060,18 @@ function Module.Build(ctx)
 			F.buyAllow = value
 		end,
 	}, "buyAllow")
+
+	moneyRight:Slider({
+		Name = "Pays Back Within",
+		Default = 600,
+		Minimum = 60,
+		Maximum = 1800,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.buyPayback = value
+		end,
+	}, "buyPayback")
 
 	moneyRight:Slider({
 		Name = "Keep In Reserve",
