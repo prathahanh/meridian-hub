@@ -503,6 +503,55 @@ function farm.spots()
 	return ring
 end
 
+-- Which tool the farm is holding, and how often it may swing it.
+--
+-- Both tools reach the same distance, and the first version of this did not.
+-- PITCHFORK_REACH is 4.2 and reads like the answer, so the fork was given a
+-- 4.2 stud strike distance - and the farm then stood at -205,19 and never dug
+-- once. Watched: fork owned, slot 3 equipped, held frozen at 20 and the pile's
+-- remaining count unchanged for a minute.
+--
+-- Two things were wrong with that. The game decides what you are pointing at by
+-- raycasting from the camera out to INTERACT_DISTANCE, which is 20 for the fork
+-- exactly as for the hand; PITCHFORK_REACH is the fork's own geometry. And a
+-- surface strand sits about eight studs above the character's root, so a 4.2
+-- stud test on the 3D distance can never pass from the ground - while
+-- WalkToward measures the flat X and Z and reported that it had already
+-- arrived. The farm was deadlocked between a walk that thought it was there and
+-- a strike that thought it was not.
+function farm.tool()
+	local bits = farm.bits
+	local player, Config = bits.player, bits.Config
+	local owned = player:GetAttribute("PitchforkOwned") == true
+		or player:GetAttribute("PermanentPitchforkOwned") == true
+	if not owned then
+		return "Hand",
+			Config.INTERACT_DISTANCE,
+			tonumber(player:GetAttribute("HayPickCooldown")) or Config.PICK_COOLDOWN
+	end
+	return "Pitchfork",
+		Config.INTERACT_DISTANCE,
+		tonumber(player:GetAttribute("PitchforkCooldown")) or Config.PITCHFORK_COOLDOWN
+end
+
+-- Owning a tool is not holding it.
+--
+-- The treadmill in Steal An Egg needed an explicit equip request and standing on
+-- it did nothing for a night. Here PitchforkDig is refused unless the hotbar
+-- says the fork is the equipped slot, so buying it and swinging without this
+-- would have been eight dollars for nothing.
+function farm.equip(slot)
+	local bits = farm.bits
+	if tonumber(bits.player:GetAttribute("NeedleEquippedSlot")) == slot then
+		return true
+	end
+	if not bits.hotbar or not bits.due("equip", 1) then
+		return false
+	end
+	pcall(bits.hotbar.setEquipped, slot, false)
+	return tonumber(bits.player:GetAttribute("NeedleEquippedSlot")) == slot
+end
+
 function farm.sellPart()
 	local bits = farm.bits
 	if not bits then
@@ -538,6 +587,8 @@ function farm.tick()
 		return
 	end
 
+	farm.spend()
+
 	local player = bits.player
 	local capacity = tonumber(player:GetAttribute("HayCapacity")) or 25
 	local held = tonumber(player:GetAttribute("HayHeld")) or 0
@@ -549,6 +600,14 @@ function farm.tick()
 		return
 	end
 
+	local toolName, strike, cooldown = farm.tool()
+	if toolName == "Pitchfork" and not farm.equip(bits.Config.PITCHFORK_SLOT_INDEX or 3) then
+		return
+	end
+
+	-- Search wide, strike close. The hand's reach is the search radius anyway,
+	-- but the fork's is a fifth of it, so finding a target and being able to hit
+	-- it are two different questions.
 	local reach = bits.Config.INTERACT_DISTANCE
 
 	-- Move on when this spot has had its share, and keep moving until we arrive.
@@ -574,26 +633,39 @@ function farm.tick()
 		return
 	end
 
-	-- A strand worth walking for is walked to, not fired at from across the pile.
+	-- Close the distance before striking, measured flat.
+	--
+	-- WalkToward steers on the flat X and Z distance, so the test that decides
+	-- whether to walk has to use the same one, and the standoff it walks to has
+	-- to be comfortably inside the threshold. Comparing a 3D distance against a
+	-- flat standoff is what deadlocked the fork: arrived, and still too far.
+	local offset = part.Position - root.Position
+	local flat = Vector3.new(offset.X, 0, offset.Z).Magnitude
+	if flat > strike - 2 then
+		bits.core:WalkToward(part.Position, math.max(strike * 0.5, 4), 20)
+		return
+	end
 	if why == "walk" then
-		local distance = (part.Position - root.Position).Magnitude
-		if distance > reach - 2 then
-			bits.core:WalkToward(part.Position, reach - 4, 20)
-			return
-		end
+		farm.walked = (farm.walked or 0) + 1
 	end
 
-	local cooldown = tonumber(player:GetAttribute("HayPickCooldown")) or bits.Config.PICK_COOLDOWN
 	if not bits.due("pick", cooldown + 0.05) then
 		return
 	end
 
 	local id = part:GetAttribute("HayId")
 	local wasRainbow = bits.isRainbow(id)
-	-- The payload the game's own code sends. The second argument is the extra
-	-- strands a wider grab picks up, and it is empty until HayGrabCount is above
-	-- one, so it is built the way getGrabCandidates builds it or not at all.
-	bits.ask("PickHay", id, farm.candidates(part, root))
+	if toolName == "Pitchfork" then
+		-- One argument, the hay id, exactly as the game's own swing sends it.
+		-- The client takes it from the HoveredHayId attribute; we already know
+		-- which strand we picked, so it goes straight in.
+		bits.ask("PitchforkDig", id)
+	else
+		-- The second argument is the extra strands a wider grab picks up, and it
+		-- is empty until HayGrabCount is above one, so it is built the way
+		-- getGrabCandidates builds it or not at all.
+		bits.ask("PickHay", id, farm.candidates(part, root))
+	end
 	farm.picks = farm.picks + 1
 	farm.herePicks = farm.herePicks + 1
 	if wasRainbow then
@@ -664,12 +736,19 @@ function farm.sell(root)
 	-- the other way.
 	bits.ask("SellHay")
 	farm.bags = farm.bags + 1
-	farm.spend()
 end
 
+-- Spending is on its own clock, and that is not tidiness.
+--
+-- It used to run at the end of farm.sell, right after firing SellHay. SellHay is
+-- a RemoteEvent, so the server had not credited the sale yet and GetUpgradeState
+-- still returned the old balance. Watched: cash reached $8.38 with the pitchfork
+-- at $8 sitting there affordable, and it read $7.38 and decided it was still
+-- saving. Every purchase was a full bag late, which at a minute a bag is a long
+-- time to hold money for something you can already afford.
 function farm.spend()
 	local bits = farm.bits
-	if bits.F.autoBuy ~= true or not bits.due("spend", 3) then
+	if bits.F.autoBuy ~= true or not bits.due("spend", 5) then
 		return
 	end
 	local state = ladder.state()
@@ -898,6 +977,21 @@ function Module.Build(ctx)
 		end
 	end
 
+	-- The game's own hotbar, so equipping the fork is the game's own equip and
+	-- not a guess at what the server wants. Only exists in a round, and this
+	-- must not yield: Build runs while the loader is still assembling.
+	local hotbar = nil
+	do
+		local scripts = LocalPlayer:FindFirstChild("PlayerScripts")
+		local module = scripts and scripts:FindFirstChild("HotbarSlots")
+		if module then
+			local ok, loaded = pcall(require, module)
+			if ok and type(loaded) == "table" and type(loaded.setEquipped) == "function" then
+				hotbar = loaded
+			end
+		end
+	end
+
 	local overlap = OverlapParams.new()
 	overlap.FilterType = Enum.RaycastFilterType.Include
 	overlap.MaxParts = 400
@@ -954,6 +1048,7 @@ function Module.Build(ctx)
 		Config = Config,
 		isRainbow = isRainbow,
 		overlap = overlap,
+		hotbar = hotbar,
 		mark = mark,
 		remotes = {
 			GetHayState = Remotes and Remotes:FindFirstChild("GetHayState"),
