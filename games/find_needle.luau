@@ -120,7 +120,9 @@ function pile.sweep()
 		return
 	end
 	if pile.scanned ~= folder then
-		pile.scanned, pile.cursor, pile.rainbow = folder, 1, {}
+		-- pending has to go with it. A half-finished sweep of the old folder
+		-- carried into the new one is a list of destroyed parts.
+		pile.scanned, pile.cursor, pile.rainbow, pile.pending = folder, 1, {}, nil
 	end
 	local slice = math.max(400, count // 20)
 	local last = math.min(pile.cursor + slice - 1, count)
@@ -214,10 +216,11 @@ function ladder.wire(bits)
 	ladder.bits = bits
 end
 
--- Hay a second for a given bag size and seconds-per-pick, including the walk.
-function ladder.rate(capacity, perPick, perSwing)
-	local trip = 6
-	local seconds = capacity * (perSwing or perPick) + trip
+-- Hay a second for a given bag size and seconds-per-strand, including the walk
+-- to the cow and back, which is about six seconds at the 45 studs between the
+-- pile and the hole.
+function ladder.rate(capacity, perStrand)
+	local seconds = capacity * perStrand + 6
 	if seconds <= 0 then
 		return 0
 	end
@@ -404,30 +407,33 @@ function needle.find()
 	return nil
 end
 
--- Whether the server has revealed it, asked of the save rather than guessed.
-function needle.revealed()
+-- Catch a reveal that happened before we were watching.
+--
+-- NeedleTargetChanged only fires once, so a hub loaded mid-round - which is
+-- most of the time, since the pad drops you into a server already in progress -
+-- never hears it. The same id is in the GetHayState snapshot, so ask for it,
+-- but slowly: this is a RemoteFunction round trip and putting one on the
+-- highlight's own loop would be a request on a timer, which is the thing that
+-- removes accounts.
+function needle.catchUp()
 	local bits = needle.bits
-	if not bits then
-		return false
+	if not bits or needle.hayId or needle.part then
+		return
 	end
-	if needle.hayId or needle.part then
-		return true
+	local remote = bits.remotes.GetHayState
+	if not remote or not bits.due("needleCatchUp", 15) then
+		return
 	end
 	local ok, state = pcall(function()
-		return bits.remotes.GetHayState:InvokeServer()
+		return remote:InvokeServer()
 	end)
-	if ok and type(state) == "table" then
-		if state.needleClaimed == true then
-			return false
-		end
-		local id = tonumber(state.needleHayId)
-		if id then
-			needle.hayId = id
-			return true
-		end
-		return state.needleRevealed == true
+	if not ok or type(state) ~= "table" or state.needleClaimed == true then
+		return
 	end
-	return false
+	local id = tonumber(state.needleHayId)
+	if id then
+		needle.hayId = id
+	end
 end
 
 function needle.tick()
@@ -437,6 +443,9 @@ function needle.tick()
 	end
 	local F = bits.F
 	local showing = F.needleHighlight == true and bits.inRound()
+	if showing then
+		needle.catchUp()
+	end
 	local part = showing and needle.find() or nil
 
 	bits.mark.Adornee = part
@@ -581,7 +590,6 @@ function farm.tick()
 
 	local id = part:GetAttribute("HayId")
 	local wasRainbow = bits.isRainbow(id)
-	farm.held = held
 	-- The payload the game's own code sends. The second argument is the extra
 	-- strands a wider grab picks up, and it is empty until HayGrabCount is above
 	-- one, so it is built the way getGrabCandidates builds it or not at all.
