@@ -2,30 +2,42 @@
 --// universe 10539411000
 --//
 --// Two places share this module and only one of them is the game. The lobby
---// (92637789841354) is where you pick a map, pick a difficulty and spend
---// diamonds on the upgrades you keep. Every map is a place of its own, and
---// that is where leaves, bags, dumpsters, vents and cash live. Nothing else in
---// the hub has had to do this: a switch here has to ask which of the two rooms
---// it is standing in before it does anything, and the ones that cannot work
---// where you are say so instead of failing quietly.
+--// (92637789841354) picks a map, picks a difficulty and spends diamonds on the
+--// upgrades you keep. Every map is a place of its own, and that is where
+--// leaves, bags, dumpsters, vents and cash live. So a switch here asks which of
+--// the two rooms it is standing in before it does anything, and the ones that
+--// cannot work where you are say so instead of failing quietly.
 --//
---// The whole loop is the one Steal An Egg runs. Collect until the bag is full,
---// walk it to the dumpster, sell, spend the cash on carrying more, open the
---// next vent, and when the map is clear start the next run. Only the nouns
---// changed.
+--// Three numbers in here were measured on a live client rather than guessed,
+--// and each one changes what the farm is allowed to do.
 --//
---// One measured number holds the farm up, and it is the reason this file
---// exists rather than a guess: the server accepts a collect out to 32 studs
---// and SILENTLY IGNORES anything past it. Nothing comes back. CollectDenied
---// never fires. The leaf simply stays where it is. Collecting at 28.8 and 30.9
---// studs banked; 32.7, 34.2, 37.0, 38.8 and 40.5 did nothing whatsoever. A
---// farm reaching further would look perfectly healthy in its own log and bank
---// nothing all night, which is the exact shape of bug LAUNCH.md says costs a
---// night of farming.
+--// 1. A collect is accepted out to 32 studs and SILENTLY IGNORED past it. No
+--//    refusal, no CollectDenied, the leaf simply stays. 28.8 and 30.9 banked;
+--//    32.7, 34.2, 37.0, 38.8 and 40.5 did nothing at all. A farm reaching
+--//    further looks perfectly healthy in its own log and banks nothing.
+--//
+--// 2. WalkSpeed is writable here and the server leaves it alone - set to 40 it
+--//    was still 40 two seconds later. That is unusual for this kind of game and
+--//    it is why there is a speed slider at all.
+--//
+--// 3. The game re-locks the cursor to the centre every frame, so freeing it
+--//    once does nothing. The override has to run for as long as the menu is
+--//    open, which is what Free Cursor does.
+--//
+--// The endpoints that are NOT here matter as much as the ones that are.
+--// AutoCollect, AutoSell, AutoBuy, AutoVent, AutoWin, UnlockAllVents, SetCash
+--// and GiveCash all exist in the Remotes folder and NOTHING in the game's own
+--// client calls any of them - checked across all 165 decompiled client scripts.
+--// There is no payload to copy and no way to know what the server does with
+--// one, so there is no switch for them. Every other hub for this game ships an
+--// "Auto Win"; this one will not ship a button whose only honest description is
+--// "fires an unknown remote and hopes".
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local Workspace = game:GetService("Workspace")
+local RunService = game:GetService("RunService")
+local UserInputService = game:GetService("UserInputService")
 
 local Module = {
 	GameId = 10539411000,
@@ -35,12 +47,23 @@ local Module = {
 -- Hover text. One line each, written for somebody who has never seen the code.
 -- No mechanisms, and no number appears unless it is one you would actually set.
 Module.Tips = {
-	["Auto Clean"] = "Walks to the nearest leaves, picks them up, and keeps going until the bag is full.",
+	["Auto Clean"] = "Picks up every leaf it can reach, walks to the next pile when it runs out, and sells when the bag is full.",
+	["Pick By"] = "Nearest clears the ground under you fastest. Biggest Pile walks to where the leaves actually are. Worth Most goes for the rare ones first.",
+	["Reach"] = "How far it will grab from. The game stops accepting a grab a little past thirty, so the top of this slider is the real ceiling.",
 	["Sell When Full"] = "Carries a full bag to the dumpster and empties it, then goes back to the leaves.",
 	["Sell At"] = "How full the bag has to be before it is worth the walk. Below a hundred it leaves early, which pays when the dumpster is far.",
-	["Stay Within"] = "How far it will wander from where it started. Turn it up to clear a whole zone, down to work one pile.",
+	["Stay Within"] = "How far it will wander from where you switched it on. Turn it up to clear a whole zone, down to work one corner.",
+	["Unstick Me"] = "If it stops getting anywhere it jumps, forgets the leaf it was heading for and picks another.",
+	["Walk Speed"] = "How fast you move. This game lets you set it, which most do not.",
+	["Free Cursor"] = "Gives you the mouse back whenever the menu is open, so you can actually click things. The game grabs it back every frame, so this has to keep taking it.",
+	["Hands Off While Menu Is Open"] = "Stops the farm steering you while you have the menu up, so you can move yourself without fighting it.",
+	["Everything Off"] = "Kills every switch at once and gives you back your controls and your mouse. Works even if something is stuck.",
+	["Stop Everything"] = "The same as the panic key, for when you would rather click it.",
+	["Use The Rake"] = "Rakes leaves into a vent instead of picking them up. Vents pay on the spot, so there is no bag to fill and no walk to the dumpster.",
 	["Auto Bag"] = "Buys the next bag size the moment you can afford it. This is the upgrade that decides how much of a run is walking.",
-	["Auto Rake"] = "Buys the rake once there is cash for it. The rake drags leaves into vents and pays on the spot, with no bag to fill.",
+	["Auto Buy Tools"] = "Buys the rake and the leaf blower with run cash as soon as each is affordable.",
+	["Auto Tool Upgrades"] = "Spends spare cash upgrading the tool you are actually using, cheapest first.",
+	["Upgrade Which"] = "Which tool gets the spare cash.",
 	["Auto Vents"] = "Opens the next vent as soon as it is affordable. A vent is how a zone gets cleared.",
 	["Auto Start Run"] = "From the lobby, walks to a square and starts a run on its own.",
 	["Map"] = "Which map to run. The later ones need the one before it cleared on Easy first.",
@@ -49,6 +72,7 @@ Module.Tips = {
 	["Auto Diamond Upgrades"] = "Spends diamonds in the lobby on the upgrades you keep between runs.",
 	["Buy Order"] = "Which lobby upgrade gets your diamonds first.",
 	["Auto Class Spin"] = "Spins for a new class whenever you have the diamonds spare. Handy Man is the one worth chasing.",
+	["Anti AFK"] = "Stops Roblox idling you out of a long run.",
 }
 
 --------------------------------------------------------------------------------
@@ -60,9 +84,6 @@ Module.Tips = {
 -- table and is handed what it needs once through a wire. That costs nothing
 -- inside Build. ./check.sh catches the ceiling; luau-analyze does not.
 
--- A rolling record of the last things this said to the server, so a run that
--- goes wrong arrives with its own evidence rather than a snapshot of the moment
--- it stopped.
 local journal = { keep = 40, entries = {} }
 
 function journal.note(what)
@@ -73,27 +94,16 @@ function journal.note(what)
 	end
 end
 
-function journal.text()
-	local now, lines = os.clock(), {}
-	for _, entry in ipairs(journal.entries) do
-		lines[#lines + 1] = ("%5.1fs ago  %s"):format(now - entry.at, entry.what)
-	end
-	return table.concat(lines, "\n")
-end
-
 -- Maclib does not fire ANY control's callback for its own declared default, and
 -- that includes Toggles. This was watched happening rather than reasoned about:
--- Auto Bag, Auto Rake, Auto Vents and Sell When Full all ship Default = true,
--- all three drew as on, and all four flags read nil for a hundred and eight
--- seconds of live farming while cash climbed past the price of a bag upgrade
--- and nothing bought it. A switch drawn as on that behaves as off is the worst
--- kind of bug in a hub, because the person judging it is reading the interface.
+-- Auto Bag, Auto Rake, Auto Vents and Sell When Full all shipped Default = true,
+-- all drew as on, and all four flags read nil for a hundred and eight seconds of
+-- live farming while cash climbed past the price of a bag upgrade and nothing
+-- bought it. A switch drawn as on that behaves as off is the worst kind of bug
+-- in a hub, because the person judging it is reading the interface.
 --
 -- The reference module seeds only Sliders and Dropdowns, which is why this had
--- to be found again here. Rather than keep two values in step by hand, the
--- declared default is copied into the flag once the tabs exist, and the
--- control's own callback is then run so that what happens is the behaviour
--- being restored rather than a value being copied.
+-- to be found again here.
 local seeded = {}
 
 function seeded.apply(core)
@@ -107,8 +117,7 @@ function seeded.apply(core)
 			local settings = entry.control and entry.control.Settings
 			-- Not `... and settings.Default or nil`: that idiom turns a
 			-- perfectly good `false` into nil, which is how every toggle
-			-- declaring Default = false ends up unseeded. It reads the same as
-			-- off today only because every test in this file asks `== true`.
+			-- declaring Default = false ends up unseeded.
 			local default = nil
 			if type(settings) == "table" then
 				default = settings.Default
@@ -138,44 +147,132 @@ function seeded.apply(core)
 end
 
 --------------------------------------------------------------------------------
--- the map half
+-- getting out of the way
+--------------------------------------------------------------------------------
+--
+-- This section exists because of one sentence: "bro wait i cant even MOVE".
+--
+-- A farm that walks for you has to hold your controls, and this one held them
+-- while the menu was open and kept holding them after the farm was switched
+-- off. Both are now impossible. Three separate things guarantee it, because the
+-- one that matters is whichever still works when something else is stuck.
+
+local guard = { bits = nil, toggles = {}, cursorOn = false }
+
+function guard.wire(bits)
+	guard.bits = bits
+end
+
+-- Remember every toggle so the panic can put them all back to off *visibly*,
+-- not just clear the flags behind a control that still reads on.
+function guard.watch(flag, control)
+	guard.toggles[flag] = control
+end
+
+function guard.menuOpen()
+	local window = guard.bits and guard.bits.window
+	if not window then
+		return false
+	end
+	local ok, state = pcall(window.GetState, window)
+	if ok then
+		return state == true
+	end
+	return false
+end
+
+-- May the farm steer right now?
+function guard.mayDrive()
+	local F = guard.bits.F
+	if F.leafHandsOff ~= false and guard.menuOpen() then
+		return false
+	end
+	return true
+end
+
+-- The game writes MouseBehavior every frame, so freeing the cursor once does
+-- nothing at all - measured: set to Default, and it was LockCenter again a
+-- second and a half later. So this runs on RenderStepped and only while the
+-- menu is actually open, because taking the mouse off somebody who is playing
+-- would be its own bug.
+function guard.cursorTick()
+	local F = guard.bits.F
+	local want = F.leafFreeCursor ~= false and guard.menuOpen()
+	if want then
+		if UserInputService.MouseBehavior ~= Enum.MouseBehavior.Default then
+			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+		end
+		guard.cursorOn = true
+	elseif guard.cursorOn then
+		-- Hand it back exactly once, then leave the game alone.
+		guard.cursorOn = false
+	end
+end
+
+-- Everything off, controls returned, mouse returned. This has to work when the
+-- farm is mid-walk, mid-sell and holding the control module, so it does not ask
+-- anything politely: it clears the flags, puts every toggle back to off on
+-- screen, stops the loops that steer, and hands the legs back.
+function guard.panic(quiet)
+	local bits = guard.bits
+	if not bits then
+		return
+	end
+	local core, F = bits.core, bits.F
+	for flag, control in pairs(guard.toggles) do
+		F[flag] = false
+		pcall(function()
+			control:UpdateState(false)
+		end)
+	end
+	pcall(function()
+		core:SetControls(true)
+	end)
+	pcall(function()
+		UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+	end)
+	local hum = core:Humanoid()
+	if hum then
+		pcall(function()
+			hum.AutoRotate = true
+			hum:Move(Vector3.zero, false)
+		end)
+	end
+	journal.note("panic")
+	if not quiet then
+		core:Notify(Module.Name, "Everything off. You have your controls back.", 5)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- reading the map
 --------------------------------------------------------------------------------
 
--- Measured, not chosen. See the header: past this the server ignores a collect
--- without a word. The farm asks for a little less than the true ceiling,
--- because the leaf and the character both move between the frame that picked
--- the target and the frame that sends it.
-local REACH = 30
+-- Measured, not chosen. See the header. The slider tops out here because past
+-- it the server stops answering without saying so.
+local REACH_MAX = 30
 
-local farm = {
-	bits = nil,
-	near = {},
-	scanAt = 0,
-	nextGrab = 0,
-	sim = nil,
-	simAt = 0,
-	anchor = nil,
-}
+-- Height is checked separately from distance, because the server checks it
+-- separately. Two leaves 18.9 studs away, one 2.9 below and one 14.5 below:
+-- the first banked, the second was ignored without a word. Eight is inside the
+-- one that worked and well short of the one that did not.
+local VERT = 8
 
-function farm.wire(bits)
-	farm.bits = bits
-end
+local look = { sim = nil, simAt = 0, near = {}, scanAt = 0, best = nil }
 
 -- The game's own client wrapper, which is why this module never has to guess at
 -- a payload. LeafSim stamps each leaf with the epoch the server handed out and
 -- fires CollectLeaf itself, so collecting is its collectMany and never a remote
--- call written here.
---
--- It only exists in a map place, so a nil answer is also how the rest of this
--- file knows it is standing in the lobby.
-function farm.module()
-	if farm.sim then
-		return farm.sim
+-- call written here. It only exists in a map place, so a nil answer is also how
+-- the rest of this file knows it is standing in the lobby.
+function look.module()
+	if look.sim then
+		return look.sim
 	end
-	if os.clock() - farm.simAt < 2 then
+	if os.clock() - look.simAt < 2 then
 		return nil
 	end
-	farm.simAt = os.clock()
+	look.simAt = os.clock()
 	local player = Players.LocalPlayer
 	local scripts = player and player:FindFirstChild("PlayerScripts")
 	local mod = scripts and scripts:FindFirstChild("LeafSim")
@@ -184,18 +281,130 @@ function farm.module()
 	end
 	local ok, value = pcall(require, mod)
 	if ok and type(value) == "table" and type(value.collectMany) == "function" then
-		farm.sim = value
+		look.sim = value
 		return value
 	end
 	return nil
 end
 
-function farm.inMap()
-	return farm.module() ~= nil
+function look.inMap()
+	return look.module() ~= nil
 end
 
--- What the bag is doing, straight off the attributes the game keeps on the
--- player. Nothing here is asked of the server.
+function look.value(sim, part)
+	local ok, v = pcall(sim.leafValueOfPart, part)
+	return (ok and tonumber(v)) or 1
+end
+
+-- One pass over the leaf folder, at most once a second.
+--
+-- A map holds upwards of thirteen thousand leaf parts and the farm ticks ten
+-- times a second, so scanning every tick is a hundred and thirty thousand
+-- distance tests a second for an answer that barely moves. Leaves do not run
+-- away. The same pass also finds the thickest patch, because walking to where
+-- the leaves are is worth far more than shaving a stud off the nearest one.
+function look.scan(sim, root, anchor, wander)
+	if os.clock() - look.scanAt < 1 then
+		return look.near
+	end
+	look.scanAt = os.clock()
+
+	local found, cells = {}, {}
+	local bestCell, bestCount = nil, 0
+	for _, part in ipairs(sim.folder:GetChildren()) do
+		if part:IsA("BasePart") then
+			local at = part.Position
+			if (at - anchor).Magnitude <= wander then
+				found[#found + 1] = {
+					part = part,
+					d = (at - root).Magnitude,
+					v = look.value(sim, part),
+				}
+				-- Sixty-stud buckets, so a "pile" is about two reaches across
+				-- and standing in the middle of one is worth the walk.
+				local key = ("%d:%d"):format(math.floor(at.X / 60), math.floor(at.Z / 60))
+				local cell = cells[key]
+				if not cell then
+					cell = { n = 0, x = 0, z = 0, y = at.Y }
+					cells[key] = cell
+				end
+				cell.n = cell.n + 1
+				cell.x = cell.x + at.X
+				cell.z = cell.z + at.Z
+				if cell.n > bestCount then
+					bestCount, bestCell = cell.n, cell
+				end
+			end
+		end
+	end
+
+	table.sort(found, function(a, b)
+		return a.d < b.d
+	end)
+	-- Only the front of the list is ever used, and holding thirteen thousand
+	-- entries alive between ticks shows up as frame time rather than as a bug.
+	while #found > 100 do
+		table.remove(found)
+	end
+	look.near = found
+	look.best = bestCell and bestCount >= 8
+		and Vector3.new(bestCell.x / bestCell.n, bestCell.y, bestCell.z / bestCell.n)
+		or nil
+	return found
+end
+
+-- Which leaf to walk at, given what the user asked for. `bad` is the set the
+-- farm has already fired at and watched do nothing, so it does not walk back to
+-- the spot it just gave up on.
+function look.target(mode, bad)
+	local list = look.near
+	if #list == 0 then
+		return nil
+	end
+	local best = nil
+	for _, entry in ipairs(list) do
+		if entry.part.Parent and not (bad and bad[entry.part]) then
+			if mode == "Worth Most" then
+				-- Value first, distance only as the tie-break. The rare leaves
+				-- are worth five ordinary ones and there are about five of them
+				-- in four thousand, so one is worth crossing a pile for.
+				if not best or entry.v > best.v then
+					best = entry
+				end
+			else
+				-- The list is already sorted nearest first.
+				return entry
+			end
+		end
+	end
+	return best
+end
+
+--------------------------------------------------------------------------------
+-- the farm
+--------------------------------------------------------------------------------
+
+local SELL_TRY = 14
+
+local farm = {
+	bits = nil,
+	nextGrab = 0,
+	anchor = nil,
+	sellTries = 0,
+	stuckAt = nil,
+	stuckSince = 0,
+	working = 0,
+	miss = 0,
+	bad = {},
+	pending = nil,
+	pendingBag = 0,
+	movedFrom = nil,
+}
+
+function farm.wire(bits)
+	farm.bits = bits
+end
+
 function farm.bag()
 	local player = Players.LocalPlayer
 	local held = tonumber(player:GetAttribute("Leaves")) or 0
@@ -205,50 +414,14 @@ function farm.bag()
 	return held, cap, endless
 end
 
--- How many leaves one grab may take, and how long until the next is allowed.
--- Both are upgrades, so both are read from the game rather than fixed: Hold is
--- how many extra come with the one you reached for, Dexterity is the cooldown
--- in seconds.
 function farm.grabSize(sim)
 	local ok, extra = pcall(sim.upgEffect, "Hand", "Hold")
-	return 1 + (ok and tonumber(extra) or 0)
+	return 1 + ((ok and tonumber(extra)) or 0)
 end
 
 function farm.cooldown(sim)
 	local ok, seconds = pcall(sim.upgEffect, "Hand", "Dexterity")
-	return ok and tonumber(seconds) or 0.5
-end
-
--- The leaves worth walking to, refreshed on a timer rather than every tick.
---
--- A map holds upwards of thirteen thousand leaf parts and the farm ticks ten
--- times a second, so scanning the folder every tick is a hundred and thirty
--- thousand distance tests a second for an answer that barely moves. Once a
--- second is plenty: leaves do not run away.
-function farm.scan(sim, root)
-	if os.clock() - farm.scanAt < 1 then
-		return farm.near
-	end
-	farm.scanAt = os.clock()
-
-	local wander = tonumber(farm.bits.F.leafWander) or 250
-	local anchor = farm.anchor or root.Position
-	local found = {}
-	for _, part in ipairs(sim.folder:GetChildren()) do
-		if part:IsA("BasePart") and (part.Position - anchor).Magnitude <= wander then
-			found[#found + 1] = { part = part, d = (part.Position - root.Position).Magnitude }
-		end
-	end
-	table.sort(found, function(a, b)
-		return a.d < b.d
-	end)
-	-- Only the front of the list is ever used, and holding thirteen thousand
-	-- entries alive between ticks shows up as frame time rather than as a bug.
-	while #found > 80 do
-		table.remove(found)
-	end
-	farm.near = found
-	return found
+	return (ok and tonumber(seconds)) or 0.5
 end
 
 function farm.dumpster(from)
@@ -273,7 +446,19 @@ function farm.dumpster(from)
 end
 
 -- One step of the trip home. Returns true while it still wants the legs.
-function farm.sell()
+--
+-- The trip and the attempt are deliberately separate, and that is not tidiness.
+-- A dumpster is a solid model whose pivot sits inside it, so a standoff tighter
+-- than the model is a deadlock: the character walks up, stops against the side
+-- about ten studs from the pivot, cannot close the gap through solid geometry,
+-- and a walker that only sells once it reports "arrived" therefore never sells.
+-- Watched happening: the bag sat at 75/75 for ninety seconds, five studs from
+-- where it had sold successfully a minute earlier, while an EmptyBackpack fired
+-- by hand from that exact spot emptied it 75 -> 4.
+--
+-- EmptyBackpack is a RemoteEvent and answers nothing, so "did it work" cannot be
+-- asked, only observed. The bag going down is the only truth available.
+function farm.sell(mayWalk)
 	local bits = farm.bits
 	local root = bits.core:Root()
 	if not root then
@@ -284,19 +469,73 @@ function farm.sell()
 		bits.sayOnce("dump", "No dumpster here", "Nothing on this map takes a full bag, so selling is off.")
 		return false
 	end
-	if not bits.core:WalkToward(where, 10, 60) then
+
+	local flat = Vector3.new(where.X - root.Position.X, 0, where.Z - root.Position.Z).Magnitude
+	local touching = Players.LocalPlayer:GetAttribute("HoveringDumpster") == true
+	if flat > SELL_TRY and not touching then
+		if mayWalk then
+			bits.core:WalkToward(where, 6, tonumber(bits.F.leafSpeed) or 24)
+		end
+		farm.sellTries = 0
 		return true
+	end
+
+	-- Close enough to be worth asking. Keep pressing in while asking, since
+	-- nearer is only ever better and standing still is what made the deadlock.
+	if mayWalk then
+		bits.core:WalkToward(where, 6, 20)
 	end
 	if not bits.due("empty", 1.5) then
 		return true
 	end
-	local ok, why = bits.ask("EmptyBackpack")
-	if ok then
-		bits.accepted("empty")
-	else
+
+	local before = tonumber(Players.LocalPlayer:GetAttribute("Leaves")) or 0
+	bits.ask("EmptyBackpack")
+	farm.sellTries = farm.sellTries + 1
+	if before > 0 and farm.sellTries >= 6 then
+		farm.sellTries = 0
 		bits.refused("empty", 1.5)
-		bits.sayOnce("empty", "Could not empty the bag", tostring(why))
+		bits.sayOnce("empty", "Could not empty the bag",
+			"The dumpster is not taking it from where the farm can stand.")
 	end
+	return true
+end
+
+-- Standing still while under orders is the one thing that ends a night quietly,
+-- so it gets noticed and acted on rather than logged.
+--
+-- Standing still on purpose is a different thing entirely: emptying the pile
+-- you are standing in means not moving for as long as it takes, and a watcher
+-- that cannot tell the two apart makes the farm jump every five seconds while
+-- it works. So collecting stamps `working`, and this only counts the seconds
+-- since the last thing it actually did.
+function farm.stuck(root)
+	if farm.bits.F.leafUnstick == false then
+		return false
+	end
+	if os.clock() - farm.working < 3 then
+		farm.stuckAt = nil
+		return false
+	end
+	local here = root.Position
+	if not farm.stuckAt or (here - farm.stuckAt).Magnitude > 4 then
+		farm.stuckAt, farm.stuckSince = here, os.clock()
+		return false
+	end
+	if os.clock() - farm.stuckSince < 5 then
+		return false
+	end
+	farm.stuckAt, farm.stuckSince = here, os.clock()
+	local hum = farm.bits.core:Humanoid()
+	if hum then
+		pcall(function()
+			hum:ChangeState(Enum.HumanoidStateType.Jumping)
+		end)
+	end
+	-- Forget the patch it was walking at, so it picks somewhere else next tick.
+	look.scanAt = 0
+	look.best = nil
+	journal.note("unstick")
 	return true
 end
 
@@ -306,7 +545,7 @@ function farm.tick()
 	if not bits or bits.F.autoClean ~= true then
 		return false
 	end
-	local sim = farm.module()
+	local sim = look.module()
 	if not sim then
 		return false
 	end
@@ -319,63 +558,273 @@ function farm.tick()
 	if not root then
 		return false
 	end
+
+	-- The menu being open means the person is using it, so the farm does not
+	-- get the legs. It does still get to pick up what is already within arm's
+	-- reach, because that takes nothing away from them.
+	--
+	-- The first version of this stopped the whole farm while the menu was open,
+	-- which reads fine and is useless: the menu is open at the moment you
+	-- switch anything on, so Auto Clean appeared to do nothing until you closed
+	-- the window. Every walk site asks this instead.
+	local mayWalk = guard.mayDrive()
+	if not mayWalk then
+		core:SetControls(true)
+	end
 	if not farm.anchor then
 		farm.anchor = root.Position
 	end
+
+	local hum = core:Humanoid()
+	local speed = tonumber(bits.F.leafSpeed) or 16
+	if hum and speed > 0 and math.abs(hum.WalkSpeed - speed) > 0.5 then
+		-- Writable here, and it stays written. Checked: set 40, still 40 two
+		-- seconds later.
+		hum.WalkSpeed = speed
+	end
+
+	farm.stuck(root)
 
 	-- Full bag first. Nothing else matters until it is empty again, and the game
 	-- says how full it is rather than it being counted here.
 	local held, cap, endless = farm.bag()
 	local at = (tonumber(bits.F.leafSellAt) or 100) / 100
 	if not endless and bits.F.leafSell ~= false and held >= math.max(1, math.floor(cap * at)) then
-		return farm.sell()
+		return farm.sell(mayWalk)
 	end
+	farm.sellTries = 0
 
-	local list = farm.scan(sim, root)
-	local target = list[1]
-	if not target or not target.part.Parent then
-		farm.near = {}
+	local wander = tonumber(bits.F.leafWander) or 250
+	local list = look.scan(sim, root.Position, farm.anchor, wander)
+	if #list == 0 then
+		-- Nothing left inside the leash. Say so once rather than stand there.
+		bits.sayOnce("empty-area", "Nothing left to clean here",
+			"Everything inside Stay Within is gone. Turn it up or move.")
 		return false
 	end
 
-	-- Walk in until the collect is inside the measured ceiling. The standoff is
-	-- well short of it, so arriving is never a photo finish.
-	if (target.part.Position - root.Position).Magnitude > REACH * 0.6 then
-		core:WalkToward(target.part.Position, REACH * 0.4, 70)
-		return true
+	local reach = math.clamp(tonumber(bits.F.leafReach) or REACH_MAX, 4, REACH_MAX)
+	local mode = tostring(bits.F.leafPick or "Nearest")
+
+	-- Grab first, walk second, and never the other way round.
+	--
+	-- The obvious shape - decide on a target, walk until you have arrived, then
+	-- collect - deadlocks in this game, and it took a hook on both calls to see
+	-- it. This module measured the distance to the leaf in three dimensions and
+	-- decided 18.9 studs was too far to grab; Core:WalkToward measures the
+	-- ground it has to cover, which is flat X and Z, and decided 12.05 studs
+	-- was inside its standoff and it had arrived. Both were right and both were
+	-- stable, so the farm stood on a ledge fourteen studs above a leaf calling
+	-- WalkToward nine times a second, moving nowhere, collecting nothing, with
+	-- six hundred and fifty-nine leaves inside its own reach the whole time.
+	--
+	-- Asking "is anything in reach" first cannot deadlock, because it is the
+	-- same question the collect itself answers.
+	-- Did the last grab actually land?
+	--
+	-- It has to be asked, because the server never says. Two leaves at exactly
+	-- the same distance behaved differently - 3d 18.9 both, one 2.9 studs below
+	-- and one 14.5 studs below - and only the near-level one banked. So the
+	-- reach is not a sphere: something about the drop, a floor or a line of
+	-- sight, is also being checked, and the refusal is silence either way.
+	--
+	-- Rather than reverse-engineer that geometry from two samples, the farm
+	-- watches its own bag. A grab that does not move it is written off, the
+	-- leaves it was aimed at are struck off, and after a few in a row it stops
+	-- reaching from where it is standing and goes somewhere else.
+	if farm.pending then
+		if held > farm.pendingBag then
+			farm.miss = 0
+		else
+			farm.miss = farm.miss + 1
+			for _, part in ipairs(farm.pending) do
+				farm.bad[part] = true
+			end
+		end
+		farm.pending = nil
 	end
 
-	if os.clock() < farm.nextGrab then
-		return true
-	end
-
-	-- Everything already in range, nearest first, up to what the bag will take
-	-- and what one grab is allowed to hold.
 	local room = endless and 40 or math.max(0, cap - held)
-	if room <= 0 then
-		return true
-	end
-	local batch, want = {}, math.min(farm.grabSize(sim), room)
-	for _, entry in ipairs(list) do
-		if #batch >= want then
-			break
+	local batch, want = {}, math.min(farm.grabSize(sim), math.max(room, 0))
+	if room > 0 and farm.miss < 3 then
+		for _, entry in ipairs(list) do
+			if #batch >= want then
+				break
+			end
+			local off = entry.part.Position - root.Position
+			-- Height is its own test, not part of the distance one.
+			if entry.part.Parent == sim.folder
+				and not farm.bad[entry.part]
+				and math.abs(off.Y) <= VERT
+				and off.Magnitude <= reach
+			then
+				batch[#batch + 1] = entry.part
+			end
 		end
-		if entry.part.Parent == sim.folder
-			and (entry.part.Position - root.Position).Magnitude <= REACH
-		then
-			batch[#batch + 1] = entry.part
-		end
 	end
-	if #batch == 0 then
+
+	if #batch > 0 then
+		-- Standing still on purpose while the pile under us empties is not
+		-- being stuck, so the watcher is told the legs are not wanted.
+		farm.working = os.clock()
+		if os.clock() < farm.nextGrab then
+			return true
+		end
+		pcall(sim.collectMany, batch)
+		farm.pending, farm.pendingBag = batch, held
+		farm.nextGrab = os.clock() + math.max(farm.cooldown(sim), 0.1)
+		-- The list is stale the moment a grab lands, and reusing it is how a
+		-- farm ends up reaching for leaves already in its own bag.
+		look.scanAt = 0
 		return true
 	end
 
-	local ok = pcall(sim.collectMany, batch)
-	journal.note(("collect %d %s"):format(#batch, ok and "ok" or "threw"))
-	farm.nextGrab = os.clock() + math.max(farm.cooldown(sim), 0.1)
-	-- The list is stale the moment a grab lands, and reusing it is how a farm
-	-- ends up reaching for leaves that are already in its own bag.
-	farm.scanAt = 0
+	-- Nothing in reach, so go somewhere there is something. Walk to the
+	-- thickest patch rather than the closest single leaf: clearing where the
+	-- leaves actually are beats shaving a stud off the walk.
+	local target = look.target(mode, farm.bad)
+	if not target or not target.part.Parent then
+		look.scanAt = 0
+		return false
+	end
+	if not mayWalk then
+		return false
+	end
+
+	-- Having moved is what makes a spot worth trying again, so the write-offs
+	-- are forgiven on arrival somewhere new rather than on a timer.
+	if not farm.movedFrom or (root.Position - farm.movedFrom).Magnitude > 25 then
+		farm.movedFrom = root.Position
+		farm.miss = 0
+		farm.bad = {}
+	end
+
+	local goal = target.part.Position
+	if mode == "Biggest Pile" and look.best then
+		goal = look.best
+	end
+	-- A standoff well inside the reach, so arriving and being able to grab are
+	-- never two different answers again.
+	core:WalkToward(goal, math.min(6, reach * 0.3), speed)
+	return true
+end
+
+--------------------------------------------------------------------------------
+-- the rake
+--------------------------------------------------------------------------------
+--
+-- The better half of this game, and the reason a bag upgrade is not the only
+-- thing worth buying. A rake drags leaves into a vent and the vent pays on the
+-- spot: no bag to fill, no walk to the dumpster, no trip at all.
+--
+-- LeafSim.rake takes a world position to aim at and refuses anything past
+-- Upg_Rake_Range studs, so the aim has to be a real point near the character
+-- rather than the vent itself.
+
+local rake = { bits = nil, nextSwing = 0 }
+
+function rake.wire(bits)
+	rake.bits = bits
+end
+
+function rake.vent(from)
+	local map = Workspace:FindFirstChild("Map")
+	local folder = map and map:FindFirstChild("Vents")
+	if not folder then
+		return nil
+	end
+	local best, bestAway = nil, math.huge
+	for _, vent in ipairs(folder:GetDescendants()) do
+		if vent:IsA("BasePart") then
+			local away = (vent.Position - from).Magnitude
+			if away < bestAway then
+				best, bestAway = vent.Position, away
+			end
+		end
+	end
+	return best
+end
+
+function rake.range()
+	local ok, cfg = pcall(require, ReplicatedStorage:FindFirstChild("UpgradeConfig"))
+	local level = tonumber(Players.LocalPlayer:GetAttribute("Upg_Rake_Range")) or 0
+	if ok and type(cfg) == "table" then
+		local effects = cfg.tools and cfg.tools.Rake and cfg.tools.Rake.upgrades
+			and cfg.tools.Rake.upgrades.Range and cfg.tools.Rake.upgrades.Range.effects
+		if type(effects) == "table" then
+			return tonumber(effects[math.clamp(level, 0, #effects - 1) + 1]) or 12
+		end
+	end
+	return 12
+end
+
+-- Returns true while it wants the legs, so the collector stands down.
+function rake.tick()
+	local bits = rake.bits
+	if not bits or bits.F.leafUseRake ~= true then
+		return false
+	end
+	local player = Players.LocalPlayer
+	if player:GetAttribute("OwnsRake") ~= true then
+		return false
+	end
+	local sim = look.module()
+	if not sim or type(sim.rake) ~= "function" then
+		return false
+	end
+	local core = bits.core
+	if not core:Alive2() then
+		return false
+	end
+	local root = core:Root()
+	if not root then
+		return false
+	end
+	-- Same rule as the collector: sweeping where you already stand is fine with
+	-- the menu open, walking somewhere is not.
+	local mayWalk = guard.mayDrive()
+
+	-- The rake only works on what is next to a vent, so the vent is the place
+	-- to stand, not the leaves.
+	local vent = rake.vent(root.Position)
+	if not vent then
+		return false
+	end
+
+	if player:GetAttribute("SelectedTool") ~= "Rake" then
+		if bits.due("equipRake", 2) then
+			bits.ask("EquipTool", "Rake")
+		end
+		return true
+	end
+
+	local reach = rake.range()
+	if (vent - root.Position).Magnitude > reach + 8 then
+		if not mayWalk then
+			return false
+		end
+		core:WalkToward(vent, reach, tonumber(bits.F.leafSpeed) or 24)
+		return true
+	end
+
+	if os.clock() < rake.nextSwing then
+		return true
+	end
+	rake.nextSwing = os.clock() + 0.35
+
+	-- Aim at the leaves nearest the vent, inside the rake's own range, so the
+	-- sweep pushes them the last few studs in.
+	local aim, bestAway = nil, math.huge
+	for _, entry in ipairs(look.near) do
+		local at = entry.part.Position
+		if (at - root.Position).Magnitude <= reach then
+			local away = (at - vent).Magnitude
+			if away < bestAway then
+				aim, bestAway = at, away
+			end
+		end
+	end
+	pcall(sim.rake, aim or vent)
 	return true
 end
 
@@ -410,11 +859,19 @@ function shop.spend(key, action, ...)
 	shop.bits.ask(action, ...)
 end
 
+function shop.config()
+	local ok, cfg = pcall(require, ReplicatedStorage:FindFirstChild("UpgradeConfig"))
+	if ok and type(cfg) == "table" then
+		return cfg
+	end
+	return nil
+end
+
 -- The bag, which is the upgrade a run is shaped by: every level is fewer walks
 -- to the dumpster and more of the run spent actually clearing.
 function shop.bagTick()
 	local bits = shop.bits
-	if bits.F.leafAutoBag ~= true or not farm.inMap() then
+	if bits.F.leafAutoBag ~= true or not look.inMap() then
 		return
 	end
 	local level = tonumber(Players.LocalPlayer:GetAttribute("BagLevel")) or 0
@@ -430,38 +887,81 @@ function shop.bagTick()
 		return
 	end
 	shop.spend("bag", "BuyBagUpgrade")
-	bits.core:Notify("Meridian", "Bought a bigger bag", 4)
+	bits.core:Notify(Module.Name, "Bought a bigger bag", 4)
 end
 
--- The rake, which is the other half of how this game is actually played: it
--- drags leaves into a vent and pays on the spot, with no bag to fill and no
--- walk to make.
-function shop.rakeTick()
+-- The tools, cheapest first. The rake changes how the game is played and the
+-- blower is the one after it.
+function shop.toolTick()
 	local bits = shop.bits
-	if bits.F.leafAutoRake ~= true or not farm.inMap() then
+	if bits.F.leafAutoTools ~= true or not look.inMap() then
 		return
 	end
-	if Players.LocalPlayer:GetAttribute("OwnsRake") == true then
+	local cfg = shop.config()
+	if not cfg or type(cfg.shop) ~= "table" then
 		return
 	end
-	local ok, cfg = pcall(require, ReplicatedStorage:FindFirstChild("UpgradeConfig"))
-	local entry = ok and type(cfg) == "table" and cfg.shop and cfg.shop.Rake
-	local price = entry and tonumber(entry.cash)
-	if not price or shop.cash() < price then
+	local player = Players.LocalPlayer
+	for _, key in ipairs({ "Rake", "LeafBlower" }) do
+		local entry = cfg.shop[key]
+		local price = entry and tonumber(entry.cash)
+		local owned = player:GetAttribute("Owns" .. key) == true
+		if price and not owned then
+			if shop.cash() >= price and shop.worthAsking("tool" .. key)
+				and bits.due("tool" .. key, 6)
+			then
+				shop.spend("tool" .. key, "BuyToolCash", key)
+				bits.core:Notify(Module.Name, "Bought the " .. (entry.model or key), 5)
+			end
+			return
+		end
+	end
+end
+
+-- Upgrading whatever is actually in your hands, cheapest rung first.
+function shop.upgradeTick()
+	local bits = shop.bits
+	if bits.F.leafAutoUpg ~= true or not look.inMap() then
 		return
 	end
-	if not shop.worthAsking("rake") or not bits.due("rake", 6) then
+	local cfg = shop.config()
+	if not cfg or type(cfg.tools) ~= "table" then
 		return
 	end
-	shop.spend("rake", "BuyToolCash", "Rake")
-	bits.core:Notify("Meridian", "Bought the rake", 5)
+	local player = Players.LocalPlayer
+	local want = tostring(bits.F.leafUpgWhich or "Held Tool")
+	local toolKey = want
+	if want == "Held Tool" then
+		toolKey = tostring(player:GetAttribute("SelectedTool") or "Hand")
+	end
+	local tool = cfg.tools[toolKey]
+	if type(tool) ~= "table" or type(tool.order) ~= "table" then
+		return
+	end
+	if tool.ownsAttr and player:GetAttribute(tool.ownsAttr) ~= true then
+		return
+	end
+	if not shop.worthAsking("upg") or not bits.due("upg", 4) then
+		return
+	end
+	for _, upgName in ipairs(tool.order) do
+		local spec = tool.upgrades and tool.upgrades[upgName]
+		local level = tonumber(player:GetAttribute(("Upg_%s_%s"):format(toolKey, upgName))) or 0
+		local costs = type(spec) == "table" and spec.costs
+		local price = type(costs) == "table" and tonumber(costs[level + 1]) or nil
+		if price and shop.cash() >= price then
+			shop.spend("upg", "BuyUpgrade", toolKey, upgName)
+			journal.note(("BuyUpgrade %s %s"):format(toolKey, upgName))
+			return
+		end
+	end
 end
 
 -- Vents are how a zone gets cleared, so an unopened one is the thing standing
 -- between this run and the next map.
 function shop.ventTick()
 	local bits = shop.bits
-	if bits.F.leafAutoVent ~= true or not farm.inMap() then
+	if bits.F.leafAutoVent ~= true or not look.inMap() then
 		return
 	end
 	if not shop.worthAsking("vent") or not bits.due("vent", 8) then
@@ -476,6 +976,7 @@ function shop.ventTick()
 		local id = vent:GetAttribute("VentId") or vent:GetAttribute("Id") or vent.Name
 		if vent:GetAttribute("Unlocked") ~= true and id then
 			shop.spend("vent", "BuyVent", id)
+			journal.note("BuyVent " .. tostring(id))
 			return
 		end
 	end
@@ -492,7 +993,8 @@ end
 --
 -- And one trap that costs a run rather than a moment: the game's own TeamsClient
 -- fires "leave" on Humanoid.Jumping. Anything that jumps while standing on a
--- square drops itself out of its own queue.
+-- square drops itself out of its own queue - which is also why Unstick Me is
+-- not allowed to jump in the lobby.
 
 local lobby = { bits = nil }
 
@@ -502,7 +1004,7 @@ end
 
 function lobby.inLobby()
 	local remotes = ReplicatedStorage:FindFirstChild("Remotes")
-	return not farm.inMap()
+	return not look.inMap()
 		and remotes ~= nil
 		and remotes:FindFirstChild("TeamAction") ~= nil
 end
@@ -547,6 +1049,9 @@ function lobby.tick()
 		return
 	end
 	local core = bits.core
+	if not guard.mayDrive() then
+		return
+	end
 	local root = core:Root()
 	if not root or not core:Alive2() then
 		return
@@ -555,13 +1060,11 @@ function lobby.tick()
 	if Players.LocalPlayer:GetAttribute("InTeam") ~= true then
 		local where = lobby.square(root.Position)
 		if where then
-			core:WalkToward(where, 3, 40)
+			core:WalkToward(where, 3, 24)
 		end
 		return
 	end
 
-	-- On a square. Settle the choices before asking for the run: they are
-	-- separate events and the last one the server reads is the one that counts.
 	if not bits.due("start", 6) then
 		return
 	end
@@ -579,7 +1082,7 @@ function lobby.tick()
 	else
 		bits.ask("TeamAction", "confirm")
 	end
-	core:Notify("Meridian", ("Starting %s on %s"):format(wantMap, tostring(bits.F.leafDifficulty or "Easy")), 5)
+	core:Notify(Module.Name, ("Starting %s on %s"):format(wantMap, tostring(bits.F.leafDifficulty or "Easy")), 5)
 end
 
 -- The upgrades you keep, which are the only thing a run is really for. These
@@ -620,7 +1123,7 @@ function lobby.upgradeTick()
 			local answered, reply = bits.ask("UpgradeBuy", key)
 			if answered and reply == "bought" then
 				bits.accepted("diamond")
-				bits.core:Notify("Meridian", "Upgraded " .. key, 4)
+				bits.core:Notify(Module.Name, "Upgraded " .. key, 4)
 			end
 			return
 		end
@@ -665,7 +1168,7 @@ function Module.Build(ctx)
 	--
 	-- This game splits cleanly. The lobby answers - UpgradeBuy and ClassSpin are
 	-- RemoteFunctions and hand back the server's own word. A map does not: every
-	-- purchase and every collect there is an event that says nothing.
+	-- purchase and every collect there is an event that says nothing back.
 	local Remotes = ReplicatedStorage:FindFirstChild("Remotes")
 
 	local function ask(name, ...)
@@ -751,7 +1254,7 @@ function Module.Build(ctx)
 		core:Notify(title, body, 7)
 	end
 
-	farm.wire({
+	local bits = {
 		F = F,
 		core = core,
 		ask = ask,
@@ -760,39 +1263,75 @@ function Module.Build(ctx)
 		accepted = accepted,
 		sayOnce = sayOnce,
 		player = LocalPlayer,
-	})
-	shop.wire(farm.bits)
-	lobby.wire(farm.bits)
+		window = ctx.Window,
+	}
+	guard.wire(bits)
+	farm.wire(bits)
+	rake.wire(bits)
+	shop.wire(bits)
+	lobby.wire(bits)
 
 	----------------------------------------------------------------------------
 	-- the interface
 	----------------------------------------------------------------------------
 
 	local runTab = tabGroup:Tab({ Name = "Run", Image = "rbxassetid://10723407389" })
-	local cashTab = tabGroup:Tab({ Name = "Upgrades", Image = "rbxassetid://10734886735" })
+	local toolTab = tabGroup:Tab({ Name = "Tools", Image = "rbxassetid://10734886735" })
 	local lobbyTab = tabGroup:Tab({ Name = "Lobby", Image = "rbxassetid://10734950309" })
+	local youTab = tabGroup:Tab({ Name = "You", Image = "rbxassetid://10747373176" })
 
 	local runLeft = runTab:Section({ Side = "Left" })
 	local runRight = runTab:Section({ Side = "Right" })
-	local cashLeft = cashTab:Section({ Side = "Left" })
+	local toolLeft = toolTab:Section({ Side = "Left" })
+	local toolRight = toolTab:Section({ Side = "Right" })
 	local lobbyLeft = lobbyTab:Section({ Side = "Left" })
 	local lobbyRight = lobbyTab:Section({ Side = "Right" })
+	local youLeft = youTab:Section({ Side = "Left" })
+	local youRight = youTab:Section({ Side = "Right" })
 
 	------------------------------------------------------------------ run · left
 
 	runLeft:Header({ Text = "Clearing" })
 
-	runLeft:Toggle({
+	local cleanToggle = runLeft:Toggle({
 		Name = "Auto Clean",
 		Default = false,
 		Callback = function(state)
 			F.autoClean = state
 			if not state then
 				farm.anchor = nil
+				-- Switching it off has to stop the legs too. It did not once,
+				-- and the character carried on walking wherever it had last
+				-- been pointed with nothing running to ever stop it.
 				core:SetControls(true)
 			end
 		end,
 	}, "autoClean")
+	guard.watch("autoClean", cleanToggle)
+
+	runLeft:Dropdown({
+		Name = "Pick By",
+		Multi = false,
+		Required = true,
+		Options = { "Nearest", "Biggest Pile", "Worth Most" },
+		Default = 2,
+		Callback = function(value)
+			F.leafPick = value
+			look.scanAt = 0
+		end,
+	}, "leafPick")
+
+	runLeft:Slider({
+		Name = "Reach",
+		Default = 30,
+		Minimum = 6,
+		Maximum = 30,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.leafReach = value
+		end,
+	}, "leafReach")
 
 	runLeft:Toggle({
 		Name = "Sell When Full",
@@ -816,26 +1355,57 @@ function Module.Build(ctx)
 
 	----------------------------------------------------------------- run · right
 
-	runRight:Header({ Text = "Where" })
+	runRight:Header({ Text = "Where and how fast" })
 
 	runRight:Slider({
 		Name = "Stay Within",
 		Default = 250,
 		Minimum = 60,
-		Maximum = 600,
+		Maximum = 800,
 		DisplayMethod = "Value",
 		Precision = 0,
 		Callback = function(value)
 			F.leafWander = value
-			farm.scanAt = 0
+			look.scanAt = 0
 		end,
 	}, "leafWander")
 
-	--------------------------------------------------------------- upgrades tab
+	runRight:Slider({
+		Name = "Walk Speed",
+		Default = 24,
+		Minimum = 16,
+		Maximum = 90,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.leafSpeed = value
+		end,
+	}, "leafSpeed")
 
-	cashLeft:Header({ Text = "Spending the run's cash" })
+	runRight:Toggle({
+		Name = "Unstick Me",
+		Default = true,
+		Callback = function(state)
+			F.leafUnstick = state
+		end,
+	}, "leafUnstick")
 
-	cashLeft:Toggle({
+	----------------------------------------------------------------- tools · left
+
+	toolLeft:Header({ Text = "The rake" })
+
+	local rakeToggle = toolLeft:Toggle({
+		Name = "Use The Rake",
+		Default = false,
+		Callback = function(state)
+			F.leafUseRake = state
+		end,
+	}, "leafUseRake")
+	guard.watch("leafUseRake", rakeToggle)
+
+	toolLeft:Header({ Text = "Spending run cash" })
+
+	toolLeft:Toggle({
 		Name = "Auto Bag",
 		Default = true,
 		Callback = function(state)
@@ -843,15 +1413,38 @@ function Module.Build(ctx)
 		end,
 	}, "leafAutoBag")
 
-	cashLeft:Toggle({
-		Name = "Auto Rake",
+	toolLeft:Toggle({
+		Name = "Auto Buy Tools",
 		Default = true,
 		Callback = function(state)
-			F.leafAutoRake = state
+			F.leafAutoTools = state
 		end,
-	}, "leafAutoRake")
+	}, "leafAutoTools")
 
-	cashLeft:Toggle({
+	---------------------------------------------------------------- tools · right
+
+	toolRight:Header({ Text = "Upgrades" })
+
+	toolRight:Toggle({
+		Name = "Auto Tool Upgrades",
+		Default = true,
+		Callback = function(state)
+			F.leafAutoUpg = state
+		end,
+	}, "leafAutoUpg")
+
+	toolRight:Dropdown({
+		Name = "Upgrade Which",
+		Multi = false,
+		Required = true,
+		Options = { "Held Tool", "Hand", "Rake", "LeafBlower" },
+		Default = 1,
+		Callback = function(value)
+			F.leafUpgWhich = value
+		end,
+	}, "leafUpgWhich")
+
+	toolRight:Toggle({
 		Name = "Auto Vents",
 		Default = true,
 		Callback = function(state)
@@ -863,13 +1456,17 @@ function Module.Build(ctx)
 
 	lobbyLeft:Header({ Text = "Starting a run" })
 
-	lobbyLeft:Toggle({
+	local startToggle = lobbyLeft:Toggle({
 		Name = "Auto Start Run",
 		Default = false,
 		Callback = function(state)
 			F.leafAutoStart = state
+			if not state then
+				core:SetControls(true)
+			end
 		end,
 	}, "leafAutoStart")
+	guard.watch("leafAutoStart", startToggle)
 
 	lobbyLeft:Dropdown({
 		Name = "Map",
@@ -930,17 +1527,78 @@ function Module.Build(ctx)
 		end,
 	}, "leafAutoSpin")
 
+	-------------------------------------------------------------------- you tab
+
+	youLeft:Header({ Text = "Getting out of the way" })
+
+	youLeft:Toggle({
+		Name = "Free Cursor",
+		Default = true,
+		Callback = function(state)
+			F.leafFreeCursor = state
+		end,
+	}, "leafFreeCursor")
+
+	youLeft:Toggle({
+		Name = "Hands Off While Menu Is Open",
+		Default = true,
+		Callback = function(state)
+			F.leafHandsOff = state
+			if state then
+				core:SetControls(true)
+			end
+		end,
+	}, "leafHandsOff")
+
+	youRight:Header({ Text = "If it all goes wrong" })
+
+	youRight:Keybind({
+		Name = "Everything Off",
+		Default = Enum.KeyCode.Delete,
+		Callback = function()
+			guard.panic(false)
+		end,
+	})
+
+	youRight:Button({
+		Name = "Stop Everything",
+		Callback = function()
+			guard.panic(false)
+		end,
+	})
+
+	youRight:Toggle({
+		Name = "Anti AFK",
+		Default = true,
+		Callback = function(state)
+			F.leafAntiAfk = state
+		end,
+	}, "leafAntiAfk")
+
 	----------------------------------------------------------------------------
 	-- the loops
 	----------------------------------------------------------------------------
 
+	-- The cursor has to be taken back every frame, because the game writes it
+	-- every frame. Anything slower and it flickers between locked and free.
+	core:Connect(RunService.RenderStepped, function()
+		guard.cursorTick()
+	end)
+
+	-- One pair of legs, so one thing steers at a time and the rake gets first
+	-- refusal: it is worth more than picking up by hand and the two cannot both
+	-- be walking somewhere.
 	core:Loop("clean", 0.1, function()
+		if rake.tick() then
+			return
+		end
 		farm.tick()
 	end)
 
 	core:Loop("spend", 3, function()
 		shop.bagTick()
-		shop.rakeTick()
+		shop.toolTick()
+		shop.upgradeTick()
 		shop.ventTick()
 	end)
 
@@ -948,6 +1606,17 @@ function Module.Build(ctx)
 		lobby.tick()
 		lobby.upgradeTick()
 		lobby.spinTick()
+	end)
+
+	core:Loop("afk", 60, function()
+		if F.leafAntiAfk == false then
+			return
+		end
+		local vu = game:GetService("VirtualUser")
+		pcall(function()
+			vu:CaptureController()
+			vu:ClickButton2(Vector2.new())
+		end)
 	end)
 
 	-- Nothing in Build may yield: it runs while the loader is still assembling
@@ -961,8 +1630,9 @@ function Module.Build(ctx)
 	return {
 		Tabs = {
 			Run = runTab,
-			Upgrades = cashTab,
+			Tools = toolTab,
 			Lobby = lobbyTab,
+			You = youTab,
 		},
 		Default = runTab,
 		Tips = Module.Tips,
