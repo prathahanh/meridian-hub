@@ -1133,6 +1133,29 @@ function Module.Build(ctx)
 	-- the loops
 	----------------------------------------------------------------------------
 
+	-- The two things that make walking survive the map, and leaving them out was
+	-- watched costing a round.
+	--
+	-- WalkToward takes the keyboard with SetControls(false) and hands it back
+	-- when it arrives. If it never arrives, it never hands it back - and this
+	-- game does ship a PlayerModule, so that is a real disable and the player is
+	-- left unable to move once the farm is switched off. The watcher gives the
+	-- keyboard back a moment after anything stops steering.
+	--
+	-- And a humanoid walking in a straight line gets caught on fences. Watched:
+	-- the bag full at 100, the character wedged at -211,26 on the far side of
+	-- the pile, MoveTo pushing into geometry, and nothing selling for twenty
+	-- seconds until the round ran out. StartUnstuck notices no progress while
+	-- something is steering and escalates a jump, then a climb.
+	core:StartControlWatcher()
+	core:StartUnstuck()
+
+	-- Read by the climb, so getting over a fence happens at walking pace rather
+	-- than at the flat 34 studs a second the climb defaults to. The server owns
+	-- WalkSpeed in this game and there is no speed loop running, so this is the
+	-- speed the character actually has.
+	core.ApproachSpeed = 20
+
 	core:Loop("farm", 0.1, function()
 		farm.tick()
 	end)
