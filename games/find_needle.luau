@@ -512,11 +512,27 @@ function farm.tick()
 	end
 
 	local reach = bits.Config.INTERACT_DISTANCE
+
+	-- Move on when this spot has had its share, and keep moving until we arrive.
+	--
+	-- Advancing the spot on its own does nothing, which is how the first version
+	-- of this behaved: there was still hay within twenty studs, so the next tick
+	-- picked it, wander was never reached, and the farm stood at one point of the
+	-- ring for fifty-five seconds and eighty-five picks. Watched. The needle only
+	-- reveals for picks near wherever it is buried, so a farm that hollows out one
+	-- side is a farm that never finds it.
+	if farm.moving then
+		if farm.wander(root) then
+			farm.moving = false
+		end
+		return
+	end
+
 	local walkFor = bits.F.rainbowFirst == false and 0 or (tonumber(bits.F.rainbowWalk) or 0)
 	local part, why = pile.pick(root.Position, reach, walkFor)
 
 	if not part then
-		farm.wander(root)
+		farm.moving = true
 		return
 	end
 
@@ -548,11 +564,11 @@ function farm.tick()
 	end
 
 	-- Eighteen picks near the needle is what the server wants before it reveals
-	-- it, so a farm that never leaves one side of the pile is a farm that never
-	-- finds it. Spread unless told not to.
+	-- it, and this gives each point of the ring more than that before moving on.
 	if bits.F.farmSpread ~= false and farm.herePicks >= 24 then
 		farm.herePicks = 0
 		farm.spot = farm.spot % 8 + 1
+		farm.moving = true
 	end
 end
 
@@ -635,19 +651,32 @@ function farm.spend()
 	end
 end
 
+-- Walk to the spot we are headed for. True once we are standing on it.
 function farm.wander(root)
 	local bits = farm.bits
 	local ring = farm.spots()
 	local where = ring[farm.spot]
 	if not where then
-		return
+		return true
 	end
-	if (where - root.Position).Magnitude <= 6 then
-		farm.spot = farm.spot % #ring + 1
+	local flat = Vector3.new(where.X - root.Position.X, 0, where.Z - root.Position.Z)
+	if flat.Magnitude <= 6 then
 		farm.herePicks = 0
-		return
+		return true
+	end
+	-- Give up on a spot we cannot get to rather than lean on it for good. The
+	-- pile is fenced in places and one point of the ring can be behind geometry.
+	if bits.due("wanderGiveUp", 12) then
+		if farm.stuckAt and (farm.stuckAt - root.Position).Magnitude < 4 then
+			farm.spot = farm.spot % #ring + 1
+			farm.herePicks = 0
+			farm.stuckAt = nil
+			return true
+		end
+		farm.stuckAt = root.Position
 	end
 	bits.core:WalkToward(where, 5, 20)
+	return false
 end
 
 --------------------------------------------------------------------------------
