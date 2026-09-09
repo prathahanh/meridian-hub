@@ -27,6 +27,37 @@ open it.
   the other four.
 - Work on `main`. Pull before you push.
 
+## Your client, and only yours
+
+Five sessions means five Roblox clients. Real runs them: Account Manager to
+launch each account into its game, then Auto Attach -> Attach All Instances.
+The MCP is the part that needs care.
+
+**No MCP tool takes a client id.** `eval`, `start-job`, `execute-file` and the
+rest all run in "the active client", and `set-active-client` is the only thing
+that picks it. So before any burst of game tools: `list-clients`, then
+`set-active-client` with your own pid, then this.
+
+    local p = game.Players.LocalPlayer
+    return ("%s | %d"):format(p.Name, game.PlaceId)
+
+If the name coming back is not your account, the pointer moved and every result
+you were about to trust belongs to another session's game. Set it again and
+re-check. Doing this costs one call and is the only thing standing between five
+sessions and a whole day of results attributed to the wrong game.
+
+`list-clients` also reports `fps` and `healthWarnings`. Five clients on six
+cores drags all of them, and a client at eight fps answers a round trip
+perfectly well while its loops starve. Read the warning before believing a
+timing result.
+
+Only one window holds focus, and `isrbxactive` is false in the other four, so
+native input silently does nothing there. Anything that has to move a real
+mouse gets tested alone, with the other clients closed.
+
+Accounts live in Real's Account Manager. One per session, assigned up front, so
+that two sessions never launch the same one.
+
 ## Adding a game
 
 1. `cp games/_template.luau games/<game>.luau`
