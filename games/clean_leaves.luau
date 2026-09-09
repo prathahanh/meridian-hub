@@ -408,6 +408,7 @@ local farm = {
 	nextGrab = 0,
 	anchor = nil,
 	sellTries = 0,
+	badDump = {},
 	stuckAt = nil,
 	stuckSince = 0,
 	working = 0,
@@ -442,25 +443,37 @@ function farm.cooldown(sim)
 	return (ok and tonumber(seconds)) or 0.5
 end
 
+-- The nearest dumpster that has not already refused us.
+--
+-- Nearest alone is wrong, and the game says so out loud: "Unlock the Backyard
+-- first to sell here!". A map's dumpsters sit in zones, a zone you have not
+-- opened will not take your leaves, and the farm cannot know which is which
+-- from the outside. It does not need to - it can notice. A dumpster that takes
+-- a full bag and does nothing gets struck off and the next nearest is tried.
 function farm.dumpster(from)
 	local map = Workspace:FindFirstChild("Map")
 	local folder = map and map:FindFirstChild("Dumpsters")
 	if not folder then
-		return nil
+		return nil, nil
 	end
-	local best, bestAway = nil, math.huge
+	local best, bestModel, bestAway = nil, nil, math.huge
 	for _, model in ipairs(folder:GetChildren()) do
 		local ok, pivot = pcall(function()
 			return model:GetPivot()
 		end)
-		if ok then
+		if ok and not farm.badDump[model] then
 			local away = (pivot.Position - from).Magnitude
 			if away < bestAway then
-				best, bestAway = pivot.Position, away
+				best, bestModel, bestAway = pivot.Position, model, away
 			end
 		end
 	end
-	return best
+	if not best then
+		-- Every one of them has refused. They cannot all be locked, so the
+		-- reason was something else and the list is worth forgetting.
+		farm.badDump = {}
+	end
+	return best, bestModel
 end
 
 -- One step of the trip home. Returns true while it still wants the legs.
@@ -482,7 +495,7 @@ function farm.sell(mayWalk)
 	if not root then
 		return false
 	end
-	local where = farm.dumpster(root.Position)
+	local where, model = farm.dumpster(root.Position)
 	if not where then
 		bits.sayOnce("dump", "No dumpster here", "Nothing on this map takes a full bag, so selling is off.")
 		return false
@@ -528,29 +541,19 @@ function farm.sell(mayWalk)
 		return true
 	end
 
-	-- Being AT the dumpster is not enough: the server also wants you inside a
-	-- zone. Measured the hard way - HoveringDumpster true, standing on the
-	-- ground beside it, and eight EmptyBackpack calls plus three fired by hand
-	-- all refused in silence, with CurrentZone reading None. Selling had worked
-	-- for two thousand leaves straight before a teleport put the character
-	-- outside the zone bounds.
-	--
-	-- Nothing can be done about it from here, so it is said out loud once
-	-- rather than retried into a wall all night.
-	if tostring(Players.LocalPlayer:GetAttribute("CurrentZone")) == "None" then
-		bits.sayOnce("nozone", "Cannot sell out here",
-			"The dumpster only takes leaves while you are inside a zone. Walk back into one.")
-		return false
-	end
-
 	local before = tonumber(Players.LocalPlayer:GetAttribute("Leaves")) or 0
 	bits.ask("EmptyBackpack")
 	farm.sellTries = farm.sellTries + 1
 	if before > 0 and farm.sellTries >= 6 then
 		farm.sellTries = 0
-		bits.refused("empty", 1.5)
-		bits.sayOnce("empty", "Could not empty the bag",
-			"The dumpster is not taking it from where the farm can stand.")
+		if model then
+			farm.badDump[model] = true
+			journal.note("dumpster refused, trying another")
+		else
+			bits.refused("empty", 1.5)
+			bits.sayOnce("empty", "Could not empty the bag",
+				"No dumpster on this map is taking it.")
+		end
 	end
 	return true
 end
