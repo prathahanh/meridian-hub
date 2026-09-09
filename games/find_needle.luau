@@ -377,13 +377,29 @@ function needle.forget()
 	needle.hayId, needle.part, needle.said = nil, nil, false
 end
 
+-- Is this part still the needle?
+--
+-- Asked every time and not remembered from when it was true once. A HayPiece is
+-- pooled: the same instance is recycled into an ordinary strand, so a cached
+-- part that is merely still parented is not still the needle. Watched - the
+-- marker was cleared off a part and the highlight stayed lit on it, pointing at
+-- a perfectly ordinary piece of hay.
+function needle.holds(part)
+	if not part or not part.Parent then
+		return false
+	end
+	if part:GetAttribute("IsNeedleObjective") then
+		return true
+	end
+	return needle.hayId ~= nil and part:GetAttribute("HayId") == needle.hayId
+end
+
 -- The part the needle is in, if the game is showing one.
 function needle.find()
-	local bits = needle.bits
-	if not bits then
+	if not needle.bits then
 		return nil
 	end
-	if needle.part and needle.part.Parent then
+	if needle.holds(needle.part) then
 		return needle.part
 	end
 	needle.part = nil
@@ -392,15 +408,9 @@ function needle.find()
 	local hidden = Workspace:FindFirstChild("HiddenNeedleClient")
 	for _, where in ipairs({ hidden, folder }) do
 		for _, part in ipairs(where and where:GetChildren() or {}) do
-			if part:IsA("BasePart") then
-				if part:GetAttribute("IsNeedleObjective") then
-					needle.part = part
-					return part
-				end
-				if needle.hayId and part:GetAttribute("HayId") == needle.hayId then
-					needle.part = part
-					return part
-				end
+			if part:IsA("BasePart") and needle.holds(part) then
+				needle.part = part
+				return part
 			end
 		end
 	end
@@ -1009,9 +1019,28 @@ function Module.Build(ctx)
 	-- PlayerGui rather than gethui(), for the same reason measured there: a loop
 	-- thread can write to the world all day but cannot write to anything inside
 	-- gethui().
+	local playerGui = LocalPlayer:WaitForChild("PlayerGui")
+
+	-- Sweep our own leftovers before adding another set.
+	--
+	-- Core:Unload destroys everything it was handed, but a run that is replaced
+	-- while it is still loading never publishes a handle, so nothing ever calls
+	-- its Unload - and Build has already parented this folder by then. Watched
+	-- after nine reloads: two MeridianNeedle folders in PlayerGui, the live one
+	-- correctly dark and the orphan still lit on an ordinary strand, because a
+	-- dead loop's last write is permanent. main.luau sweeps its own windows by
+	-- name for exactly this reason; this is the same sweep for the same reason.
+	for _, old in ipairs(playerGui:GetChildren()) do
+		if old.Name == "MeridianNeedle" then
+			pcall(function()
+				old:Destroy()
+			end)
+		end
+	end
+
 	local holder = Instance.new("Folder")
 	holder.Name = "MeridianNeedle"
-	holder.Parent = LocalPlayer:WaitForChild("PlayerGui")
+	holder.Parent = playerGui
 	core:Track(holder)
 
 	local mark = Instance.new("Highlight")
