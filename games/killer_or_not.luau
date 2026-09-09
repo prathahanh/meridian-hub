@@ -50,7 +50,7 @@ Module.Tips = {
 	["Rest When Full"] = "Stands still once the round has given you everything it is going to. Off keeps it walking, which looks busier and earns nothing.",
 	["Show Coins"] = "Draws every coin left on the map through walls.",
 	["Show How Far"] = "Adds the distance to each coin.",
-	["Anti AFK"] = "Stops Roblox idling you out.",
+	["Anti AFK"] = "Stops Roblox idling you out. Switching it back off only takes hold the next time the hub loads.",
 }
 
 --------------------------------------------------------------------------------
@@ -88,14 +88,19 @@ end
 
 --------------------------------------------------------------------------------
 
--- Maclib fires a Toggle's callback when the control is created and does NOT
--- fire a Slider's or a Dropdown's. So every slider default shows on screen and
--- never reaches the flags, and what runs is whatever fallback the reading code
--- happened to use. In Steal An Egg that shipped: the control read one thing and
--- the farm did another, for as long as the control had existed.
+-- A control's declared default has to reach the flag it writes, and Maclib
+-- cannot be relied on to carry it there. Sliders and Dropdowns definitely do not
+-- fire their own callback at build time; whether a Toggle does has been recorded
+-- both ways in this codebase, which is reason enough not to bet a switch on it.
 --
--- Copying the declared default into the flag once the tabs exist makes the
--- control the only place a default lives.
+-- In Steal An Egg the slider version of this shipped: the control read one thing
+-- and the farm did another, for as long as the control had existed. That is the
+-- worst kind of bug in a hub, because the person judging it is reading the
+-- interface.
+--
+-- So every kind is seeded, and separately every read of a flag in this file is
+-- written to agree with the default its control shows. Either alone would do;
+-- together they mean a control cannot lie even if the other half is wrong.
 local seeded = {}
 
 function seeded.apply(core)
@@ -103,12 +108,22 @@ function seeded.apply(core)
 	for _, entry in ipairs(core.Controls or {}) do
 		local flag = entry.flag or entry.Flag
 		local kind = entry.kind or entry.Kind
-		if flag and flags[flag] == nil and (kind == "Slider" or kind == "Dropdown") then
+		if flag and flags[flag] == nil and (kind == "Slider" or kind == "Dropdown" or kind == "Toggle") then
 			local settings = entry.control and entry.control.Settings
 			local default = type(settings) == "table" and settings.Default or nil
 			local value = nil
 			if kind == "Slider" then
 				value = tonumber(default)
+			elseif kind == "Toggle" then
+				-- Toggles are seeded too, and the template does not do this.
+				-- Whether Maclib fires a Toggle's own callback at build time has
+				-- been recorded both ways in this codebase, so neither answer is
+				-- worth betting a control on: seed it, and separately make every
+				-- read of a flag agree with the default its control displays.
+				-- Four switches in this file used to read as off while showing
+				-- on, which is the worst kind of bug in a hub, because the person
+				-- judging it is reading the interface.
+				value = type(default) == "boolean" and default or nil
 			elseif type(settings) == "table" then
 				local options = settings.Options
 				local index = tonumber(default)
@@ -242,6 +257,7 @@ local nav = {
 	index = 1,
 	busy = false,
 	failedAt = 0,
+	noRoute = nil,
 	bound = false,
 }
 
@@ -294,11 +310,17 @@ function nav.plan(goal)
 			if ok and path.Status == Enum.PathStatus.Success then
 				nav.goal = goal
 				nav.points = path:GetWaypoints()
+				nav.noRoute = nil
 				-- The first waypoint is where we already are.
 				nav.index = math.min(2, #nav.points)
 			else
 				nav.clear()
 				nav.failedAt = os.clock()
+				-- Remembered rather than just counted, so whoever asked for this
+				-- goal can stop asking. A coin standing on a table answers
+				-- NoPath every time, and waiting out Give Up After on each one
+				-- is eighteen seconds of walking into furniture.
+				nav.noRoute = goal
 			end
 		end
 		nav.busy = false
@@ -441,6 +463,8 @@ local farm = {
 	skip = {},
 	taken = 0,
 	seenCoins = nil,
+	closest = math.huge,
+	gainedAt = 0,
 	warnedAt = 0,
 	said = nil,
 }
@@ -457,6 +481,9 @@ end
 function farm.forget()
 	farm.target = nil
 	farm.since = 0
+	farm.closest = math.huge
+	farm.gainedAt = 0
+	nav.noRoute = nil
 end
 
 function farm.cap()
@@ -523,6 +550,50 @@ function farm.pick(from, reach)
 	return best, bestAt
 end
 
+-- Getting away from the killer, and it is deliberately not part of the coin
+-- run any more.
+--
+-- It started life inside farm.tick, after the switch that turns collecting on.
+-- That made a Round tab safety switch quietly depend on a Coins tab farming
+-- switch: with Auto Coins off, Keep Away did nothing at all, and the control
+-- read on the whole time. It also wrote the headline itself, which the stats
+-- loop then overwrote a second later, so there was no way to see it working
+-- either.
+--
+-- Now it runs first, whatever else is on, and leaves a mark behind it.
+function farm.fleeing()
+	return farm.fleeUntil ~= nil and os.clock() < farm.fleeUntil
+end
+
+function farm.keepAway()
+	local bits = farm.bits
+	if not bits then
+		return false
+	end
+	local F, core = bits.F, bits.core
+	if F.keepAway ~= true or round.murderer == bits.player.Name then
+		return false
+	end
+
+	local root = core:Root()
+	if not root or round.amDead() then
+		return false
+	end
+
+	local at = round.killerAt()
+	if not at or (at - root.Position).Magnitude > (tonumber(F.keepAwayRange) or 30) then
+		return false
+	end
+
+	if not farm.fleeing() then
+		journal.note(("keeping away from %s"):format(tostring(round.murderer)))
+	end
+	farm.fleeUntil = os.clock() + 1
+	farm.forget()
+	nav.away(at)
+	return true
+end
+
 function farm.tick()
 	local bits = farm.bits
 	if not bits then
@@ -548,20 +619,6 @@ function farm.tick()
 		return
 	end
 
-	-- Keeping away from the killer beats collecting, always, and it is the one
-	-- thing that has to happen on the frame it becomes true rather than after
-	-- the current coin is finished.
-	if F.keepAway == true and round.murderer ~= (bits.player.Name) then
-		local at = round.killerAt()
-		local within = tonumber(F.keepAwayRange) or 30
-		if at and (at - root.Position).Magnitude <= within then
-			farm.forget()
-			nav.away(at)
-			core.Headline = "Getting away from " .. tostring(round.murderer)
-			return
-		end
-	end
-
 	if farm.full() then
 		if farm.target then
 			farm.forget()
@@ -582,13 +639,37 @@ function farm.tick()
 		target = nil
 	end
 
-	if target and os.clock() - farm.since > (tonumber(F.coinsGiveUp) or 18) then
-		-- Put it aside rather than throwing it away. Coins on furniture are
-		-- unreachable from here and perfectly reachable from a staircase.
-		farm.skip[target] = os.clock() + 25
-		journal.note("gave up on a coin")
-		farm.forget()
-		target = nil
+	if target then
+		local why = nil
+		local gap = (target.Position - root.Position).Magnitude
+
+		-- Closing, or at least not stalled? Then keep going, whatever the clock
+		-- says. Only a walk that has stopped getting nearer is a walk to give up
+		-- on, and the two coins that cost the most were a coin fifteen studs
+		-- away for thirty-six seconds and one directly overhead for eighteen.
+		if gap < farm.closest - 1 then
+			farm.closest, farm.gainedAt = gap, os.clock()
+		elseif os.clock() - farm.gainedAt > 7 then
+			why = "no nearer for seven seconds"
+		end
+
+		if nav.noRoute and (nav.noRoute - target.Position).Magnitude < 1 then
+			-- The route said there is no way there. Asking again in eighteen
+			-- seconds will get the same answer, because the furniture has not
+			-- moved.
+			why = "no route to it"
+		elseif os.clock() - farm.since > (tonumber(F.coinsGiveUp) or 18) then
+			why = "took too long"
+		end
+
+		if why then
+			-- Put it aside rather than throwing it away: a coin unreachable from
+			-- this room is perfectly reachable from the top of the stairs.
+			farm.skip[target] = os.clock() + 25
+			journal.note("gave up on a coin · " .. why)
+			farm.forget()
+			target = nil
+		end
 	end
 
 	if not target then
@@ -599,6 +680,9 @@ function farm.tick()
 			return
 		end
 		farm.target, farm.since = chosen, os.clock()
+		farm.closest = (chosen.Position - root.Position).Magnitude
+		farm.gainedAt = os.clock()
+		nav.noRoute = nil
 		nav.clear()
 		target = chosen
 	end
@@ -902,14 +986,14 @@ function Module.Build(ctx)
 			return F.espKiller ~= false
 		end
 		if role == "Sheriff" then
-			return F.espSheriff == true
+			return F.espSheriff ~= false
 		end
 		return F.espEveryone == true
 	end
 
 	core:Loop("people", 0.25, function()
 		local myRoot = core:Root()
-		if F.espKiller == false and F.espSheriff ~= true and F.espEveryone ~= true then
+		if F.espKiller == false and F.espSheriff == false and F.espEveryone ~= true then
 			marks.hideFrom(marks.people, 1)
 			return
 		end
@@ -943,7 +1027,7 @@ function Module.Build(ctx)
 						if dead then
 							text = text .. " · out"
 						end
-						if F.espPerk == true and role == "Murderer" then
+						if F.espPerk ~= false and role == "Murderer" then
 							local row = round.row(player.Name)
 							local perk = row and row.Perk
 							if perk and perk ~= "" then
@@ -1008,7 +1092,7 @@ function Module.Build(ctx)
 			slot = slot + 1
 			local mark = marks.coins[slot]
 			local part, distance = entry.part, entry.distance
-			mark.label.Text = F.coinEspDistance == true
+			mark.label.Text = F.coinEspDistance ~= false
 					and ("Coin · %dm"):format(math.floor(distance))
 				or "Coin"
 			mark.label.TextColor3 = marks.colours.Coin
@@ -1059,7 +1143,7 @@ function Module.Build(ctx)
 	-- One warning, not a stream of them. A killer who walks past you twice is
 	-- one event to a person and two hundred to a loop.
 	core:Loop("warn", 0.4, function()
-		if F.warnClose ~= true then
+		if F.warnClose == false then
 			return
 		end
 		local root = core:Root()
@@ -1083,6 +1167,11 @@ function Module.Build(ctx)
 	end)
 
 	core:Loop("coins", 0.15, function()
+		-- Getting away wins over collecting, always, and it has to be able to
+		-- win on a tick where collecting is switched off entirely.
+		if farm.keepAway() then
+			return
+		end
 		farm.tick()
 	end)
 
@@ -1097,10 +1186,14 @@ function Module.Build(ctx)
 			or "waiting for a round"
 		core.Stats = carried
 
+		-- One writer for the headline. It used to have two, and the loop that
+		-- ran seven times a second lost every time to the one that ran once.
 		if not round.tag then
 			core.Headline = "In the lobby"
 		elseif round.amDead() then
 			core.Headline = "Out this round"
+		elseif farm.fleeing() then
+			core.Headline = "Getting away from " .. tostring(round.murderer)
 		elseif F.autoCoins == true and farm.full() then
 			core.Headline = "Every coin this round will give"
 		elseif farm.target then
@@ -1129,16 +1222,31 @@ function Module.Build(ctx)
 	-- Disabling the Idled connections is quieter than pretending to click:
 	-- VirtualUser is a CoreScript API, and a normal script reaching for it every
 	-- twenty minutes all night is a loud thing to be doing.
+	--
+	-- But it only goes one way, and the switch used to pretend otherwise.
+	-- Measured here: this game has exactly one Idled handler, it is a native
+	-- connection rather than a Luau one (LuaConnection false, Function nil), and
+	-- Real's `connection:Enable()` returns perfectly happily on those and leaves
+	-- Enabled false. Off, off, off, three times in a row, with the toggle
+	-- reading whatever the user had just clicked.
+	--
+	-- So the switch does what it can and says what it cannot, rather than
+	-- showing a state the client is not in.
 	core.SetAntiAfk = function(on)
-		return pcall(function()
+		local restored = true
+		local ok = pcall(function()
 			for _, connection in ipairs(getconnections(LocalPlayer.Idled)) do
 				if on then
 					connection:Disable()
 				else
 					connection:Enable()
+					if connection.Enabled ~= true then
+						restored = false
+					end
 				end
 			end
 		end)
+		return ok, restored
 	end
 
 	task.spawn(function()
@@ -1372,7 +1480,14 @@ function Module.Build(ctx)
 		Default = true,
 		Callback = function(state)
 			F.antiAfk = state
-			core.SetAntiAfk(state)
+			local ok, restored = core.SetAntiAfk(state)
+			if not state and ok and not restored then
+				core:Notify(
+					Module.Name,
+					"Roblox will idle you out again from the next time the hub loads. It cannot be put back mid-session.",
+					7
+				)
+			end
 		end,
 	}, "antiAfk")
 
