@@ -35,25 +35,38 @@ The MCP is the part that needs care.
 
 **No MCP tool takes a client id.** `eval`, `start-job`, `execute-file` and the
 rest all run in "the active client", and `set-active-client` is the only thing
-that picks it. So before any burst of game tools: `list-clients`, then
-`set-active-client` with your own pid, then this.
+that picks it.
 
-    local p = game.Players.LocalPlayer
-    return ("%s | %d"):format(p.Name, game.PlaceId)
+**Re-asserting it is not enough, and this was measured with five sessions live.**
+`set-active-client` returned "active client set to 14068" and the very next call
+ran in another session's game. It happened on four separate calls in one hour.
+The pointer is taken between any two calls, not between bursts, so there is no
+sequence of calls that reliably holds it. Stop trying to hold it and make the
+code survive losing it.
 
-If the name coming back is not your account, the pointer moved and every result
-you were about to trust belongs to another session's game. Set it again and
-re-check. Doing this costs one call and is the only thing standing between five
-sessions and a whole day of results attributed to the wrong game.
+1. **Guard every script on its first line.**
 
-`list-clients` also reports `fps` and `healthWarnings`. Five clients on six
-cores drags all of them, and a client at eight fps answers a round trip
-perfectly well while its loops starve. Read the warning before believing a
-timing result.
+        if game.PlaceId ~= <yours> then
+            warn("[meridian] wrong client, place " .. tostring(game.PlaceId))
+            return
+        end
 
-Only one window holds focus, and `isrbxactive` is false in the other four, so
-native input silently does nothing there. Anything that has to move a real
-mouse gets tested alone, with the other clients closed.
+   A wrong landing becomes a no-op with a message instead of damage, so a retry
+   costs nothing. This caught a load that would have put the whole hub into
+   another session's client.
+
+2. **Report through a file, not a return value.** `writefile("yours.json", ...)`
+   in game, then read it from the shell. A return value comes back attributed to
+   whichever client answered, which is worse than no answer at all. Save
+   progressively, so a run that gets kicked still leaves what it learned.
+
+3. **`execute-file` names the client it dispatched to.** Its reply says
+   `scheduled: client 14068`, which is the only honest confirmation available.
+   Read it every time; if it is the wrong pid, just fire again.
+
+4. **Namespace your files.** The Real workspace folder is shared by all five
+   sessions, and so is the git working tree. Prefix output files with your game
+   and only ever `git add` your own paths.
 
 Accounts live in Real's Account Manager. One per session, assigned up front, so
 that two sessions never launch the same one.
