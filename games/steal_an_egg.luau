@@ -868,10 +868,27 @@ function port.wire(RS)
 	local Geometry = Util and port.load(Util, "GuardAreaGeometry")
 	local Homestead = Remotes.Homestead
 	local PlotCmds = {
+		-- AskState replaced GetPlotData but ships only OwnersBySlot and a
+		-- revision, and the old table carried PlotFolder, which is what
+		-- treadmillSpot walks to. Without it the fallback never fires and a
+		-- fresh account stands still for ever: watched doing exactly that for
+		-- ninety seconds. OwnersBySlot is keyed by slot string and holds the
+		-- owner's user id, so the folder is one lookup away.
 		GetPlotData = function()
 			if type(Homestead) ~= "table" or not Homestead.AskState then return nil end
 			local ok, state = port.send(Homestead.AskState)
-			return ok and state or nil
+			if not ok or type(state) ~= "table" then return nil end
+			local me = tostring(game:GetService("Players").LocalPlayer.UserId)
+			local plots = game:GetService("Workspace"):FindFirstChild("Plots")
+			for slot, owner in pairs(state.OwnersBySlot or {}) do
+				if tostring(owner) == me then
+					state.PlotSlot = tostring(slot)
+					state.PlotFolder = plots and plots:FindFirstChild(tostring(slot))
+					break
+				end
+			end
+			if not state.PlotFolder then port.note("no plot folder for " .. me) end
+			return state
 		end,
 		IsWorldPositionWithinLocalPlotBounds = function(position)
 			if type(Geometry) ~= "table" or type(Geometry.IsWithinFootprint) ~= "function" then
@@ -3073,7 +3090,15 @@ function Module.Build(ctx)
 	-- in five seconds. Mounting is a request, and until it is made a night on
 	-- the treadmill is a night of standing still.
 	function treadmill.mount()
-		if onTreadmill() then
+		-- Only a known mount skips the request. onTreadmill() falls back to
+		-- proximity when the mount event has never fired, and standing beside
+		-- the belt is precisely the state that needs asking, not the state that
+		-- skips it. Watched on a fresh account: it walked to the treadmill and
+		-- stood three studs off it for ninety seconds at Speed 10, because
+		-- being near it read as being on it. Asking when unsure costs nothing,
+		-- because the server answering "Already using" is handled below as the
+		-- success it is.
+		if treadmill.active == true then
 			return true
 		end
 		if not nearTreadmill() then
