@@ -47,6 +47,7 @@ Module.Tips = {
 	["Fight At Range"] = "Never closes to weapon distance. Slower, and a room full of them cannot reach you.",
 	["Keep Distance"] = "How far away to stand while fighting at range.",
 	["Equip Best Weapon"] = "Puts on the hardest hitting weapon you own that your level allows.",
+	["Prefer"] = "Which number counts as hardest hitting. Your starting dagger and wand are the same size on paper and go with opposite skill points, so this is the one that decides between them.",
 	["Keep Best Weapon On"] = "Checks again whenever your gear changes, so a weapon that drops mid run goes on by itself.",
 	["Spend Points On"] = "Where new skill points go. Stamina is health, and health is what stops a run ending early.",
 	["Spend Them Now"] = "Puts every point you have saved into the stat above.",
@@ -883,16 +884,45 @@ function gear.bestWeapon()
 		return nil
 	end
 	local level = ladder.level()
+	local prefer = gear.bits and gear.bits.F.dqPrefer or "Whichever Is Higher"
+
+	-- The larger of the two stats on its own is not enough, and the starting
+	-- gear proves it: the Bronze Dagger is 6 physical and 1 spell, the Starter
+	-- Wand is 1 physical and 6 spell, so by the larger number they tie exactly
+	-- and which one goes on is whichever pairs happened to come out of the table
+	-- first. They are not interchangeable - this game spends skill points into
+	-- physicalPower and spellPower as two separate ladders - so which stat
+	-- counts is the player's decision and not something to guess.
+	local function score(item)
+		local physical = tonumber(item.physicalDamage) or 0
+		local spell = tonumber(item.spellPower) or 0
+		if prefer == "Physical" then
+			return physical
+		elseif prefer == "Spell" then
+			return spell
+		end
+		return math.max(physical, spell)
+	end
+
 	local bestKey, bestScore, bestName, alreadyOn = nil, -1, nil, false
 	for key, item in pairs(weapons) do
 		if type(item) == "table" then
 			local req = tonumber(item.levelReq) or 1
-			-- Physical and spell are two ladders and a weapon usually leads on
-			-- one of them, so the larger of the two is what it is worth.
-			local score = math.max(tonumber(item.physicalDamage) or 0, tonumber(item.spellPower) or 0)
-			if req <= level and score > bestScore then
-				bestKey, bestScore, bestName = key, score, item.name
+			local value = score(item)
+			-- Strictly greater, so a tie leaves whatever is already on alone
+			-- rather than swapping back and forth between two equal weapons
+			-- every time the loop comes round.
+			if req <= level and value > bestScore then
+				bestKey, bestScore, bestName = key, value, item.name
 				alreadyOn = item.equipped == true
+			end
+		end
+	end
+	-- A tie that the equipped weapon is part of is not worth a swap.
+	if bestKey and not alreadyOn then
+		for key, item in pairs(weapons) do
+			if type(item) == "table" and item.equipped == true and score(item) >= bestScore then
+				return nil
 			end
 		end
 	end
@@ -1478,6 +1508,17 @@ function Module.Build(ctx)
 			end)
 		end,
 	})
+
+	gearLeft:Dropdown({
+		Name = "Prefer",
+		Multi = false,
+		Required = true,
+		Options = { "Whichever Is Higher", "Physical", "Spell" },
+		Default = 1,
+		Callback = function(value)
+			F.dqPrefer = value
+		end,
+	}, "dqPrefer")
 
 	gearLeft:Toggle({
 		Name = "Keep Best Weapon On",
