@@ -31,32 +31,31 @@ local Module = {
 -- Hover text. One line each, for somebody who has never seen the code. No
 -- mechanisms, and no number that is not one you would actually set.
 Module.Tips = {
-	["Silent Aim"] = "Every gun you fire hits whoever you picked, without your aim moving on screen.",
-	["Aim At"] = "Whether it takes the player closest to where you are already looking, or simply the closest one to you.",
-	["Only The Other Team"] = "Never picks a team mate. Off lets it take anybody.",
-	["Aim Range"] = "How far away a player can be and still be picked.",
-	["Longer Reach"] = "Lets you take, kick and tackle the ball from further away than your legs should manage.",
-	["How Much Further"] = "How far past normal. Two is already very noticeable; high numbers look like the ball is magnetic.",
-	["Take Their Shots"] = "Turns the pass assist on their shots as well as your own team passes, so balls flying past you stick to you instead.",
-	["Never Run Out"] = "Stamina stops draining, so you can sprint the whole match.",
-	["Faster"] = "Raises your sprint speed.",
-	["How Much Faster"] = "The multiplier on your speed. The server watches movement, so high numbers are the ones it argues with first.",
-	["Aim For The Corner"] = "Every shot goes to the corner their keeper is furthest from, worked out as you strike rather than a corner you picked in advance.",
-	["Shot Preview"] = "Marks the exact spot on the goal a shot is going to cross, the moment it leaves someone's boot.",
-	["Draw The Flight"] = "Draws the ball's whole path to that spot, bounces included.",
-	["Show Where It Lands"] = "Marks where the ball is going to touch down, for a pass or a clearance rather than a shot.",
-	["Warn On Target"] = "Tells you when a shot is heading at your goal, and how long you have.",
-	["Both Goals"] = "Also marks shots at the other goal, so you can see your own team's chances as well as the danger.",
-	["Path Detail"] = "How finely the flight path is drawn. Lower is lighter on frames.",
+	["Silent Aim"] = "Guns hit who you pick, not where you point.",
+	["Aim At"] = "Who to pick: the one nearest your crosshair, or the one nearest you.",
+	["Only The Other Team"] = "Never picks a team mate.",
+	["Aim Range"] = "How far away they can be.",
+	["Aim For The Corner"] = "Shots go to the corner their keeper is furthest from.",
+	["Longer Reach"] = "Take, kick and tackle the ball from further away.",
+	["How Much Further"] = "Two is plenty. Higher and the ball looks magnetic.",
+	["Take Their Shots"] = "Their shots stick to you too, not just your team's passes.",
+	["Never Run Out"] = "Stamina stops dropping.",
+	["Always Sprint"] = "Run at sprint speed without holding the key.",
+	["Free Mouse"] = "Unlocks the cursor so you can click the menu.",
+	["Shot Preview"] = "Marks the spot on the goal a shot is going to cross.",
+	["Draw The Flight"] = "Draws the ball's path to that spot.",
+	["Both Goals"] = "Marks shots at their goal as well as yours.",
+	["Path Detail"] = "How finely the path is drawn. Lower is lighter.",
+	["Warn On Target"] = "Tells you when a shot is heading at your goal.",
 	["Player ESP"] = "Draws everybody through walls.",
-	["Team Colours"] = "Your team in one colour, theirs in another, instead of one colour for everybody.",
-	["Show Distance"] = "Adds how far away each player is.",
-	["Show Their Gadget"] = "Adds what they are carrying, so a shotgun and a grapple stop looking the same from across the pitch.",
-	["Mark The Keeper"] = "Picks out whoever is actually in goal on each side.",
-	["Max Distance"] = "Stops drawing players further away than this.",
-	["Text Size"] = "How big the names above players are.",
-	["Item Box ESP"] = "Draws the crates that hand out gadgets.",
-	["Anti AFK"] = "Stops Roblox idling you out. Switching it back off only takes hold the next time the hub loads.",
+	["Team Colours"] = "Your team one colour, theirs another.",
+	["Show Distance"] = "Adds how far away they are.",
+	["Show Their Gadget"] = "Adds what they are carrying.",
+	["Mark The Keeper"] = "Picks out whoever is in goal.",
+	["Max Distance"] = "Stops drawing players past this.",
+	["Text Size"] = "How big the names are.",
+	["Item Box ESP"] = "Draws the crates.",
+	["Anti AFK"] = "Stops Roblox idling you out.",
 }
 
 --------------------------------------------------------------------------------
@@ -465,10 +464,24 @@ end
 -- decides it is faster is what that exists to pull back. The stamina half has
 -- nothing of the kind pointed at it.
 
-local boost = { bits = nil, on = false }
+local boost = { bits = nil, on = false, unlocked = false }
 
 function boost.wire(bits)
 	boost.bits = bits
+end
+
+-- The actor is the PLAYER, not the character. Actors.GetFromCharacter returns
+-- the Player object, and passing the character instead is why unlimited stamina
+-- silently did nothing: HasUnlimitedStamina(character) is false while
+-- HasUnlimitedStamina(player) is true, and neither errors.
+function boost.actor()
+	local bits = boost.bits
+	local character = bits.core:Character()
+	if not character then
+		return nil, nil
+	end
+	local ok, actor = pcall(bits.Actors.GetFromCharacter, character)
+	return ok and actor or nil, character
 end
 
 function boost.tick()
@@ -477,14 +490,14 @@ function boost.tick()
 		return
 	end
 	local F, Sprint = bits.F, bits.Sprint
-	local character = bits.core:Character()
-	if not character then
+	local actor, character = boost.actor()
+	if not actor then
 		return
 	end
 
 	if F.foreverStamina == true then
 		pcall(Sprint.SetStaminaMultiplier, 0)
-		pcall(Sprint.SetUnlimitedStamina, character, "Meridian", true)
+		pcall(Sprint.SetUnlimitedStamina, actor, "Meridian", true)
 		boost.on = true
 	elseif boost.on then
 		pcall(Sprint.SetStaminaMultiplier, 1)
@@ -492,14 +505,34 @@ function boost.tick()
 		boost.on = false
 	end
 
-	local multiplier = math.clamp(tonumber(F.speedAmount) or 1, 1, 3)
-	if F.fasterLegs == true and multiplier > 1 then
+	-- ForceSprint, and no SpeedMultiplier, because the multiplier is not ours to
+	-- set. Measured: ApplyBoost with SpeedMultiplier 2 leaves WalkSpeed at 25.6,
+	-- which is just what sprinting is worth, and writing Humanoid.WalkSpeed = 40
+	-- by hand decays 40 -> 20.5 -> 16 over three seconds. The server owns the
+	-- number. What it does not own is whether you are sprinting, so this holds
+	-- you at a sprint permanently instead, which is 25.6 against a walk of 16.
+	--
+	-- DurationSeconds, not EndsAt. ApplyBoost hands it to BoostStacks.Add as the
+	-- duration and the wrong key throws inside the game rather than in here.
+	-- ApplyBoost keys by CHARACTER and SetUnlimitedStamina keys by PLAYER, in
+	-- the same module. Passing one where the other belongs fails silently in
+	-- both directions: the boost lands under a key nothing reads, and the
+	-- stamina source is set for somebody who does not exist.
+	if F.alwaysSprint == true and character then
 		pcall(Sprint.ApplyBoost, character, {
-			EndsAt = Workspace:GetServerTimeNow() + 2,
 			ForceSprint = true,
 			NoStaminaConsumption = true,
-			SpeedMultiplier = multiplier,
+			SpeedMultiplier = 1,
+			DurationSeconds = 2,
 		})
+	end
+
+	-- The game pins the cursor to the centre of the screen, which is what makes
+	-- the hub window unclickable until this is on.
+	local wantFree = F.freeMouse ~= false
+	if wantFree ~= boost.unlocked then
+		boost.unlocked = wantFree
+		pcall(bits.MouseController.SetUnlocked, "Meridian", wantFree)
 	end
 end
 
@@ -510,7 +543,8 @@ function boost.restore()
 	end
 	pcall(bits.Sprint.SetStaminaMultiplier, 1)
 	pcall(bits.Sprint.ClearUnlimitedStaminaSource, "Meridian")
-	local character = bits.core:Character()
+	pcall(bits.MouseController.SetUnlocked, "Meridian", false)
+	local _, character = boost.actor()
 	if character then
 		pcall(bits.Sprint.ClearBoost, character)
 	end
@@ -1103,6 +1137,8 @@ function Module.Build(ctx)
 		ItemIds = require(Modules.Items.ItemIds),
 		HitboxSettings = require(Modules.Gameplay.HitboxSettings),
 		Sprint = require(Modules.Actions.Sprint),
+		Actors = require(Modules.Characters.Actors),
+		MouseController = require(Client.MouseController),
 		slots = { people = 16, boxes = 12, path = 40 },
 	}
 
@@ -1355,27 +1391,25 @@ function Module.Build(ctx)
 	}, "foreverStamina")
 
 	reachRight:Toggle({
-		Name = "Faster",
+		Name = "Always Sprint",
 		Default = false,
 		Callback = function(state)
-			F.fasterLegs = state
+			F.alwaysSprint = state
 			if not state then
 				boost.restore()
 			end
 		end,
-	}, "fasterLegs")
+	}, "alwaysSprint")
 
-	reachRight:Slider({
-		Name = "How Much Faster",
-		Default = 1.3,
-		Minimum = 1,
-		Maximum = 3,
-		DisplayMethod = "Value",
-		Precision = 2,
-		Callback = function(value)
-			F.speedAmount = value
+	reachRight:Divider()
+
+	reachRight:Toggle({
+		Name = "Free Mouse",
+		Default = true,
+		Callback = function(state)
+			F.freeMouse = state
 		end,
-	}, "speedAmount")
+	}, "freeMouse")
 
 	--------------------------------------------------------------- match · left
 
