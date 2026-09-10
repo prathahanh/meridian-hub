@@ -52,6 +52,7 @@ local GAMES = {
 	{ id = 10539411000, path = "games/clean_leaves.luau", name = "Clean All The Leaves" },
 	{ id = 10756011174, path = "games/find_needle.luau", name = "Search For The Needle" },
 	{ id = 9931749389, path = "games/dungeon_quest.luau", name = "Dungeon Quest Reborn" },
+	{ id = 10155360168, path = "games/illegal_soccer.luau", name = "Illegal Soccer" },
 }
 
 --------------------------------------------------------------------------------
