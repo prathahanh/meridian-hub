@@ -41,6 +41,7 @@ Module.Tips = {
 	["Take Their Shots"] = "Their shots stick to you too, not just your team's passes.",
 	["Never Run Out"] = "Stamina stops dropping.",
 	["Always Sprint"] = "Run at sprint speed without holding the key.",
+	["No Slowdown"] = "Carrying the ball, aiming a gun and landing a tackle stop slowing you down.",
 	["Free Mouse"] = "Frees the cursor while the menu is open and gives it back when you close it.",
 	["Shot Preview"] = "Marks the spot on the goal a shot is going to cross.",
 	["Draw The Flight"] = "Draws the ball's path to that spot.",
@@ -1148,6 +1149,7 @@ function Module.Build(ctx)
 		Sprint = require(Modules.Actions.Sprint),
 		Actors = require(Modules.Characters.Actors),
 		MouseController = require(Client.MouseController),
+		Movement = require(Client.Gameplay.Player.Movement),
 		window = ctx.Window or nil,
 		slots = { people = 16, boxes = 12, path = 40 },
 	}
@@ -1163,6 +1165,27 @@ function Module.Build(ctx)
 	core:Track(function()
 		reach.restore()
 		boost.restore()
+	end)
+
+	-- Everything that slows you down goes through one function.
+	--
+	-- Movement.SetMultiplier(name, {WalkSpeed = n, JumpHeight = n}) is how the
+	-- game applies every penalty it has: carrying the ball, aiming an item
+	-- down sights at 0.75, the recovery after a tackle kick. Dropping any
+	-- WalkSpeed below 1 on the way past removes all of them at once, and the
+	-- ones that are not about speed - JumpHeight, and any multiplier above 1 -
+	-- are left exactly as the game meant them.
+	local Movement = bits.Movement
+	local setMultiplier = Movement.SetMultiplier
+	core:Override(Movement, "SetMultiplier", function(name, values, ...)
+		if F.noSlowdown == true and type(values) == "table" then
+			local walk = values.WalkSpeed
+			if type(walk) == "number" and walk < 1 then
+				values = table.clone(values)
+				values.WalkSpeed = 1
+			end
+		end
+		return setMultiplier(name, values, ...)
 	end)
 
 	-- A shot is steered on the way out, the same way the guns are.
@@ -1399,6 +1422,19 @@ function Module.Build(ctx)
 			F.foreverStamina = state
 		end,
 	}, "foreverStamina")
+
+	reachRight:Toggle({
+		Name = "No Slowdown",
+		Default = false,
+		Callback = function(state)
+			F.noSlowdown = state
+			if not state then
+				pcall(function()
+					bits.Movement.ClearMultiplier("MeridianNone")
+				end)
+			end
+		end,
+	}, "noSlowdown")
 
 	reachRight:Toggle({
 		Name = "Always Sprint",
