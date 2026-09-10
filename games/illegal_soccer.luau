@@ -41,7 +41,7 @@ Module.Tips = {
 	["Take Their Shots"] = "Their shots stick to you too, not just your team's passes.",
 	["Never Run Out"] = "Stamina stops dropping.",
 	["Always Sprint"] = "Run at sprint speed without holding the key.",
-	["Free Mouse"] = "Unlocks the cursor so you can click the menu.",
+	["Free Mouse"] = "Frees the cursor while the menu is open and gives it back when you close it.",
 	["Shot Preview"] = "Marks the spot on the goal a shot is going to cross.",
 	["Draw The Flight"] = "Draws the ball's path to that spot.",
 	["Both Goals"] = "Marks shots at their goal as well as yours.",
@@ -527,9 +527,18 @@ function boost.tick()
 		})
 	end
 
-	-- The game pins the cursor to the centre of the screen, which is what makes
-	-- the hub window unclickable until this is on.
-	local wantFree = F.freeMouse ~= false
+	-- The cursor is released while the hub window is OPEN and locked again the
+	-- moment it closes.
+	--
+	-- Not a toggle. This game pins the cursor to the centre of the screen
+	-- because that is how you aim, so a switch that frees it for the whole
+	-- match takes the game away in order to fix a menu.
+	local open = false
+	if bits.window and bits.window.GetState then
+		local fine, state = pcall(bits.window.GetState)
+		open = fine and state == true
+	end
+	local wantFree = open and F.freeMouse ~= false
 	if wantFree ~= boost.unlocked then
 		boost.unlocked = wantFree
 		pcall(bits.MouseController.SetUnlocked, "Meridian", wantFree)
@@ -1139,6 +1148,7 @@ function Module.Build(ctx)
 		Sprint = require(Modules.Actions.Sprint),
 		Actors = require(Modules.Characters.Actors),
 		MouseController = require(Client.MouseController),
+		window = ctx.Window or nil,
 		slots = { people = 16, boxes = 12, path = 40 },
 	}
 
