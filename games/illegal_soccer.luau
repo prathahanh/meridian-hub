@@ -35,6 +35,13 @@ Module.Tips = {
 	["Aim At"] = "Whether it takes the player closest to where you are already looking, or simply the closest one to you.",
 	["Only The Other Team"] = "Never picks a team mate. Off lets it take anybody.",
 	["Aim Range"] = "How far away a player can be and still be picked.",
+	["Longer Reach"] = "Lets you take, kick and tackle the ball from further away than your legs should manage.",
+	["How Much Further"] = "How far past normal. Two is already very noticeable; high numbers look like the ball is magnetic.",
+	["Take Their Shots"] = "Turns the pass assist on their shots as well as your own team passes, so balls flying past you stick to you instead.",
+	["Never Run Out"] = "Stamina stops draining, so you can sprint the whole match.",
+	["Faster"] = "Raises your sprint speed.",
+	["How Much Faster"] = "The multiplier on your speed. The server watches movement, so high numbers are the ones it argues with first.",
+	["Aim For The Corner"] = "Every shot goes to the corner their keeper is furthest from, worked out as you strike rather than a corner you picked in advance.",
 	["Shot Preview"] = "Marks the exact spot on the goal a shot is going to cross, the moment it leaves someone's boot.",
 	["Draw The Flight"] = "Draws the ball's whole path to that spot, bounces included.",
 	["Show Where It Lands"] = "Marks where the ball is going to touch down, for a pass or a clearance rather than a shot.",
@@ -101,7 +108,13 @@ function seeded.apply(core)
 			if kind == "Slider" then
 				value = tonumber(default)
 			elseif kind == "Toggle" then
-				value = type(default) == "boolean" and default or nil
+				-- Written out rather than as an and/or, because `x and default or
+				-- nil` silently yields nil for every toggle whose default is
+				-- false. That is most of them, and it is the difference between
+				-- a switch that is off and a switch that is merely unset.
+				if type(default) == "boolean" then
+					value = default
+				end
 			elseif type(settings) == "table" then
 				local options = settings.Options
 				local index = tonumber(default)
@@ -345,6 +358,263 @@ function aim.rewrite(ray)
 	aim.last, aim.firedAt = player.DisplayName, os.clock()
 	aim.shots = aim.shots + 1
 	journal.note("gun aimed at " .. player.Name)
+	return out
+end
+
+--------------------------------------------------------------------------------
+-- reach, and it is the one this game is built to give away
+--------------------------------------------------------------------------------
+--
+-- Gameplay.HitboxSettings is a plain table of sizes on a shared module, and the
+-- game measures every touch against it with its own Luau maths rather than with
+-- Roblox's Touched. That matters, because the usual trap with a grown hitbox is
+-- that BasePart:GetTouchingParts reports nothing without a TouchTransmitter, so
+-- a bigger box detects less than a small one. None of that applies here:
+-- nothing is touching anything, it is ContainsPoint against a Size.
+--
+--     Receive          5.5 x 5.25 x 5.5    taking the ball at your feet
+--     AirReceive       5   x 9    x 5      taking it out of the air
+--     AssistedReceive  8   x 9    x 8      the game's own generous one
+--     Kick             6   x 7    x 7      how near the ball must be to strike
+--     SlideTackle      5   x 5    x 5      the sliding challenge
+--
+-- The sizes are scaled in place and put back on unload. FrontAssist is a
+-- separate thing worth having: it ships as IncludesShots = false with TeamMode
+-- "Allies", so the assist only ever helps you receive a team mate's pass.
+-- Turning both around is what makes it an interception.
+
+local reach = { bits = nil, base = {}, front = nil }
+
+reach.keys = { "Receive", "AirReceive", "AssistedReceive", "Kick", "SlideTackle" }
+
+function reach.wire(bits)
+	reach.bits = bits
+	local settings = bits.HitboxSettings
+	for _, key in ipairs(reach.keys) do
+		local box = settings[key]
+		if box and box.Size then
+			reach.base[key] = box.Size
+		end
+	end
+	local front = settings.FrontAssist
+	if front then
+		reach.front = { IncludesShots = front.IncludesShots, TeamMode = front.TeamMode }
+	end
+end
+
+function reach.apply()
+	local bits = reach.bits
+	if not bits then
+		return
+	end
+	local settings = bits.HitboxSettings
+	local multiplier = 1
+	if bits.F.reachOn == true then
+		multiplier = math.clamp(tonumber(bits.F.reachAmount) or 1, 1, 6)
+	end
+	for _, key in ipairs(reach.keys) do
+		local box, base = settings[key], reach.base[key]
+		if box and base then
+			box.Size = base * multiplier
+		end
+	end
+
+	local front = settings.FrontAssist
+	if front and reach.front then
+		if bits.F.interceptShots == true then
+			front.IncludesShots = true
+			front.TeamMode = "Everyone"
+		else
+			front.IncludesShots = reach.front.IncludesShots
+			front.TeamMode = reach.front.TeamMode
+		end
+	end
+end
+
+function reach.restore()
+	local bits = reach.bits
+	if not bits then
+		return
+	end
+	local settings = bits.HitboxSettings
+	for _, key in ipairs(reach.keys) do
+		local box, base = settings[key], reach.base[key]
+		if box and base then
+			box.Size = base
+		end
+	end
+	local front = settings.FrontAssist
+	if front and reach.front then
+		front.IncludesShots = reach.front.IncludesShots
+		front.TeamMode = reach.front.TeamMode
+	end
+end
+
+--------------------------------------------------------------------------------
+-- legs
+--------------------------------------------------------------------------------
+--
+-- Sprint keeps a boost overlay per actor - EndsAt, ForceSprint,
+-- NoStaminaConsumption, SpeedMultiplier - and a stamina multiplier that scales
+-- every drain in the game. Both are the game's own controls, reapplied on a
+-- timer because a boost carries an expiry and the server hands out its own.
+--
+-- Expect the server to argue about the speed half. Characters carries
+-- MovementSnapshot, MovementCorrection and MovementRehandshake remotes, which is
+-- a movement anti-cheat with a correction channel, and a client that simply
+-- decides it is faster is what that exists to pull back. The stamina half has
+-- nothing of the kind pointed at it.
+
+local boost = { bits = nil, on = false }
+
+function boost.wire(bits)
+	boost.bits = bits
+end
+
+function boost.tick()
+	local bits = boost.bits
+	if not bits then
+		return
+	end
+	local F, Sprint = bits.F, bits.Sprint
+	local character = bits.core:Character()
+	if not character then
+		return
+	end
+
+	if F.foreverStamina == true then
+		pcall(Sprint.SetStaminaMultiplier, 0)
+		pcall(Sprint.SetUnlimitedStamina, character, "Meridian", true)
+		boost.on = true
+	elseif boost.on then
+		pcall(Sprint.SetStaminaMultiplier, 1)
+		pcall(Sprint.ClearUnlimitedStaminaSource, "Meridian")
+		boost.on = false
+	end
+
+	local multiplier = math.clamp(tonumber(F.speedAmount) or 1, 1, 3)
+	if F.fasterLegs == true and multiplier > 1 then
+		pcall(Sprint.ApplyBoost, character, {
+			EndsAt = Workspace:GetServerTimeNow() + 2,
+			ForceSprint = true,
+			NoStaminaConsumption = true,
+			SpeedMultiplier = multiplier,
+		})
+	end
+end
+
+function boost.restore()
+	local bits = boost.bits
+	if not bits then
+		return
+	end
+	pcall(bits.Sprint.SetStaminaMultiplier, 1)
+	pcall(bits.Sprint.ClearUnlimitedStaminaSource, "Meridian")
+	local character = bits.core:Character()
+	if character then
+		pcall(bits.Sprint.ClearBoost, character)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- putting it in the corner
+--------------------------------------------------------------------------------
+--
+-- A shot is Kind "Kick" with PassType "Shot", and what reaches the server for a
+-- kick is only Origin, Direction, CameraCFrame and IsAirborne. The ClientHit
+-- and TargetPosition the guns lean on are stripped by GetLaunchAim before it
+-- goes, so a kick is steered by Direction and nothing else. That is the whole
+-- feature: point it at a corner instead of at whatever the camera was on.
+--
+-- Which corner is not a preset. Every other script for this game offers "top
+-- left" and "bottom right" as fixed choices; this reads where their keeper
+-- actually is and takes the far post.
+
+local strike = { bits = nil, last = nil }
+
+function strike.wire(bits)
+	strike.bits = bits
+end
+
+-- The four corners of the mouth, inset so a shot is not scraping the frame.
+function strike.corners(goal)
+	local half = goal.Size * 0.5
+	local inset = 3
+	local out = {}
+	for _, sx in ipairs({ -1, 1 }) do
+		for _, sy in ipairs({ -1, 1 }) do
+			out[#out + 1] = goal.Position
+				+ Vector3.new((half.X - inset) * sx, (half.Y - inset) * sy, 0)
+		end
+	end
+	return out
+end
+
+function strike.keeperAt(team)
+	local bits = strike.bits
+	for _, player in ipairs(Players:GetPlayers()) do
+		local character = player.Character
+		if character and character:GetAttribute("ActiveGoalkeeper") == true then
+			local ok, name = pcall(bits.ActorTeams.GetActorTeamName, player)
+			if ok and name == team then
+				local part = character:FindFirstChild("HumanoidRootPart")
+				return part and part.Position or nil
+			end
+		end
+	end
+	return nil
+end
+
+-- The corner their keeper is furthest from.
+function strike.target()
+	local mine = predict.myTeam()
+	if not mine then
+		return nil
+	end
+	local theirs = mine == "Team1" and "Team2" or "Team1"
+	local goal = predict.goal(theirs)
+	if not goal then
+		return nil
+	end
+	local keeper = strike.keeperAt(theirs)
+	local best, bestScore = nil, nil
+	for _, corner in ipairs(strike.corners(goal)) do
+		local score = keeper and (corner - keeper).Magnitude or corner.Y
+		if not bestScore or score > bestScore then
+			best, bestScore = corner, score
+		end
+	end
+	return best
+end
+
+function strike.rewrite(command)
+	local bits = strike.bits
+	if not bits or bits.F.cornerAim ~= true or type(command) ~= "table" then
+		return command
+	end
+	if command.Kind ~= "Kick" or command.PassType ~= "Shot" then
+		return command
+	end
+	local aimDirection = command.AimDirection
+	if type(aimDirection) ~= "table" or aimDirection.Origin == nil then
+		return command
+	end
+	local corner = strike.target()
+	if not corner then
+		return command
+	end
+
+	local offset = corner - aimDirection.Origin
+	if offset.Magnitude < 1 then
+		return command
+	end
+
+	local out = table.clone(command)
+	local aimed = table.clone(aimDirection)
+	aimed.Direction = offset.Unit
+	out.AimDirection = aimed
+	strike.last = corner
+	journal.note("shot aimed at a corner")
 	return out
 end
 
@@ -831,6 +1101,8 @@ function Module.Build(ctx)
 		ActorTeams = require(Client.Gameplay.ActorTeams),
 		HeldItems = require(Modules.Items.HeldItems),
 		ItemIds = require(Modules.Items.ItemIds),
+		HitboxSettings = require(Modules.Gameplay.HitboxSettings),
+		Sprint = require(Modules.Actions.Sprint),
 		slots = { people = 16, boxes = 12, path = 40 },
 	}
 
@@ -838,6 +1110,21 @@ function Module.Build(ctx)
 	shot.wire(bits)
 	people.wire(bits)
 	aim.wire(bits)
+	reach.wire(bits)
+	boost.wire(bits)
+	strike.wire(bits)
+
+	core:Track(function()
+		reach.restore()
+		boost.restore()
+	end)
+
+	-- A shot is steered on the way out, the same way the guns are.
+	local ActionRemoteProtocol = require(Modules.Actions.ActionRemoteProtocol)
+	local sendAction = ActionRemoteProtocol.Send
+	core:Override(ActionRemoteProtocol, "Send", function(command)
+		return sendAction(strike.rewrite(command))
+	end)
 
 	-- The aim rewrite goes in before anything else, and comes back out on
 	-- unload because Core:Override remembers what was there.
@@ -877,6 +1164,10 @@ function Module.Build(ctx)
 
 	core:Loop("boxes", 0.5, function()
 		people.boxes()
+	end)
+
+	core:Loop("legs", 0.5, function()
+		boost.tick()
 	end)
 
 	core:Loop("stats", 1, function()
@@ -949,11 +1240,14 @@ function Module.Build(ctx)
 	----------------------------------------------------------------------------
 
 	local aimTab = tabGroup:Tab({ Name = "Aim", Image = "rbxassetid://10734949856" })
+	local reachTab = tabGroup:Tab({ Name = "Body", Image = "rbxassetid://10723415903" })
 	local matchTab = tabGroup:Tab({ Name = "Match", Image = "rbxassetid://10723407389" })
 	local playersTab = tabGroup:Tab({ Name = "Players", Image = "rbxassetid://10747373176" })
 	local playerTab = tabGroup:Tab({ Name = "Session", Image = "rbxassetid://10734898355" })
 
 	local aimLeft = aimTab:Section({ Side = "Left" })
+	local reachLeft = reachTab:Section({ Side = "Left" })
+	local reachRight = reachTab:Section({ Side = "Right" })
 	local matchLeft = matchTab:Section({ Side = "Left" })
 	local matchRight = matchTab:Section({ Side = "Right" })
 	local playersLeft = playersTab:Section({ Side = "Left" })
@@ -991,6 +1285,16 @@ function Module.Build(ctx)
 		end,
 	}, "aimEnemiesOnly")
 
+	aimLeft:Divider()
+
+	aimLeft:Toggle({
+		Name = "Aim For The Corner",
+		Default = false,
+		Callback = function(state)
+			F.cornerAim = state
+		end,
+	}, "cornerAim")
+
 	aimLeft:Slider({
 		Name = "Aim Range",
 		Default = 400,
@@ -1002,6 +1306,76 @@ function Module.Build(ctx)
 			F.aimRange = value
 		end,
 	}, "aimRange")
+
+	--------------------------------------------------------------- reach · left
+
+	reachLeft:Header({ Text = "Reach" })
+
+	reachLeft:Toggle({
+		Name = "Longer Reach",
+		Default = false,
+		Callback = function(state)
+			F.reachOn = state
+			reach.apply()
+		end,
+	}, "reachOn")
+
+	reachLeft:Slider({
+		Name = "How Much Further",
+		Default = 2,
+		Minimum = 1,
+		Maximum = 6,
+		DisplayMethod = "Value",
+		Precision = 1,
+		Callback = function(value)
+			F.reachAmount = value
+			reach.apply()
+		end,
+	}, "reachAmount")
+
+	reachLeft:Toggle({
+		Name = "Take Their Shots",
+		Default = false,
+		Callback = function(state)
+			F.interceptShots = state
+			reach.apply()
+		end,
+	}, "interceptShots")
+
+	-------------------------------------------------------------- reach · right
+
+	reachRight:Header({ Text = "Legs" })
+
+	reachRight:Toggle({
+		Name = "Never Run Out",
+		Default = false,
+		Callback = function(state)
+			F.foreverStamina = state
+		end,
+	}, "foreverStamina")
+
+	reachRight:Toggle({
+		Name = "Faster",
+		Default = false,
+		Callback = function(state)
+			F.fasterLegs = state
+			if not state then
+				boost.restore()
+			end
+		end,
+	}, "fasterLegs")
+
+	reachRight:Slider({
+		Name = "How Much Faster",
+		Default = 1.3,
+		Minimum = 1,
+		Maximum = 3,
+		DisplayMethod = "Value",
+		Precision = 2,
+		Callback = function(value)
+			F.speedAmount = value
+		end,
+	}, "speedAmount")
 
 	--------------------------------------------------------------- match · left
 
@@ -1165,6 +1539,7 @@ function Module.Build(ctx)
 	return {
 		Tabs = {
 			Aim = aimTab,
+			Body = reachTab,
 			Match = matchTab,
 			Players = playersTab,
 			Session = playerTab,
