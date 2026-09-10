@@ -1,22 +1,21 @@
 --// Meridian · Illegal Soccer
 --// universe 10155360168
 --//
---// Eight-a-side football with guns, jetpacks, grapples, oil and no referee.
---// The hub is here to make somebody win it, not to farm it.
+--// Eight a side football with guns, jetpacks, grapples and no referee. The hub
+--// is here to win matches, so everything in it either plays for you or takes a
+--// limit off you. Nothing in here is a readout.
 --//
---// The thing that decides what this file can do: the game simulates the ball
---// in Luau rather than leaving it to Roblox physics, and it ships the whole
---// simulator to the client. Ball.Physics can be called. GoalkeeperPrediction
---// can be called. So "where is this shot going, and when does it get there"
---// is not something to approximate with a parabola - it is one call against
---// the game's own maths, including spin, damping, bounce retention and the
---// real collision geometry.
+--// Two facts decide how the file is built.
 --//
---// This first pass draws what it knows and touches nothing. Every control in
---// here is read-only on purpose: acting on the prediction - diving, placing a
---// shot, aiming a gun - moves the character, and moving the character while
---// somebody is playing is the one thing that makes a hub unusable. Those come
---// next, switchable and off by default.
+--// The game keeps its tuning in plain Luau tables the client can reach: hitbox
+--// sizes, the ball carrier speed penalty, the sprint multiplier. Those are
+--// changed in place and put back on unload, which is why Ball Magnet and No
+--// Slowdown are three lines each instead of a fight with the engine.
+--//
+--// And every action a player can take is a client function - Shoot, Pass,
+--// SlideTackleInput, GoalkeeperDive - so the auto features press the game's own
+--// buttons rather than forging packets. Charge timing, action ids and
+--// sequencing all still come from the game, because the game is still doing it.
 
 local Players = game:GetService("Players")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
@@ -28,34 +27,25 @@ local Module = {
 	Name = "Illegal Soccer",
 }
 
--- Hover text. One line each, for somebody who has never seen the code. No
--- mechanisms, and no number that is not one you would actually set.
 Module.Tips = {
-	["Silent Aim"] = "Guns hit who you pick, not where you point.",
-	["Aim At"] = "Who to pick: the one nearest your crosshair, or the one nearest you.",
-	["Only The Other Team"] = "Never picks a team mate.",
-	["Aim Range"] = "How far away they can be.",
-	["Aim For The Corner"] = "Shots go to the corner their keeper is furthest from.",
-	["Longer Reach"] = "Take, kick and tackle the ball from further away.",
-	["How Much Further"] = "Two is plenty. Higher and the ball looks magnetic.",
-	["Take Their Shots"] = "Their shots stick to you too, not just your team's passes.",
+	["Ball Magnet"] = "The ball comes to you from much further away than it should.",
+	["How Much Bigger"] = "Times normal. Ten is enormous and very obvious.",
+	["Show The Box"] = "Draws your reach so you can see how big it is.",
+	["Auto Dribble"] = "Their shots and passes stick to you too, not just your own team's.",
+	["Auto Tackle"] = "Slide tackles whoever has the ball once they are close enough.",
+	["Auto Goal"] = "Shoots at their goal on its own once you have the ball and are in range.",
+	["Shoot From"] = "How close to their goal before it shoots.",
+	["Auto Pass"] = "Passes to a team mate when someone closes you down.",
+	["Auto Goalkeeper"] = "Dives to stop shots when you are the one in goal.",
+	["No Slowdown"] = "Carrying the ball, charging a shot and aiming a gun stop slowing you down.",
 	["Never Run Out"] = "Stamina stops dropping.",
 	["Always Sprint"] = "Run at sprint speed without holding the key.",
-	["No Slowdown"] = "Carrying the ball, aiming a gun and landing a tackle stop slowing you down.",
 	["Free Mouse"] = "Frees the cursor while the menu is open and gives it back when you close it.",
-	["Shot Preview"] = "Marks the spot on the goal a shot is going to cross.",
-	["Draw The Flight"] = "Draws the ball's path to that spot.",
-	["Both Goals"] = "Marks shots at their goal as well as yours.",
-	["Path Detail"] = "How finely the path is drawn. Lower is lighter.",
-	["Warn On Target"] = "Tells you when a shot is heading at your goal.",
-	["Player ESP"] = "Draws everybody through walls.",
-	["Team Colours"] = "Your team one colour, theirs another.",
-	["Show Distance"] = "Adds how far away they are.",
-	["Show Their Gadget"] = "Adds what they are carrying.",
-	["Mark The Keeper"] = "Picks out whoever is in goal.",
-	["Max Distance"] = "Stops drawing players past this.",
-	["Text Size"] = "How big the names are.",
-	["Item Box ESP"] = "Draws the crates.",
+	["Aim For The Corner"] = "Shots go to the corner their keeper is furthest from.",
+	["Silent Aim"] = "Guns hit who you pick, not where you point.",
+	["Aim At"] = "Who to pick: nearest your crosshair, or nearest you.",
+	["Only The Other Team"] = "Never picks a team mate.",
+	["Aim Range"] = "How far away they can be.",
 	["Anti AFK"] = "Stops Roblox idling you out.",
 }
 
@@ -63,9 +53,8 @@ Module.Tips = {
 -- file scope
 --------------------------------------------------------------------------------
 --
--- Build is ONE function against Luau's ceiling of 200 local registers. Features
--- live out here on tables and are handed what they need once, through a wire.
--- ./check.sh catches the ceiling; luau-analyze does not.
+-- Build is ONE function against Luau's ceiling of 200 local registers, so every
+-- feature lives out here and is handed what it needs once through a wire.
 
 local journal = { keep = 50, entries = {} }
 
@@ -88,12 +77,10 @@ end
 
 --------------------------------------------------------------------------------
 
--- A control's declared default has to reach the flag it writes, and Maclib
--- cannot be relied on to carry it there. Sliders and Dropdowns definitely do not
--- fire their own callback at build time, and whether a Toggle does has been
--- recorded both ways in this codebase - which is reason enough not to bet a
--- switch on it. So every kind is seeded here, and separately every read of a
--- flag in this file is written to agree with the default its control shows.
+-- Every control's declared default has to reach the flag it writes. Sliders and
+-- dropdowns definitely do not fire their own callback at build time and toggles
+-- have been recorded both ways, so all three kinds are seeded here and every
+-- read below is written to agree with the default its control shows.
 local seeded = {}
 
 function seeded.apply(core)
@@ -108,10 +95,8 @@ function seeded.apply(core)
 			if kind == "Slider" then
 				value = tonumber(default)
 			elseif kind == "Toggle" then
-				-- Written out rather than as an and/or, because `x and default or
-				-- nil` silently yields nil for every toggle whose default is
-				-- false. That is most of them, and it is the difference between
-				-- a switch that is off and a switch that is merely unset.
+				-- Spelled out, because `x and default or nil` yields nil for every
+				-- toggle that defaults to false, which is most of them.
 				if type(default) == "boolean" then
 					value = default
 				end
@@ -133,19 +118,13 @@ function seeded.apply(core)
 end
 
 --------------------------------------------------------------------------------
--- the ball, and where it is going
+-- where the ball is, and whose goal is whose
 --------------------------------------------------------------------------------
 --
--- Everything visual in this file comes from three calls the game makes itself.
---
--- The ball is not a part you can find in the workspace. Every character carries
--- a small transparent Part called "Ball" which is a hitbox and a red herring;
--- the match ball exists only through its renderer. GetOrCreateRenderer gives it
--- up, and its GetMovementState is the same table the game's own goalkeeper
--- prediction takes: Position, Velocity, Spin, Mode, and the timestamps.
---
--- The module-level GetMovementStateById and GetTargetVelocity helpers return
--- nil. Go through the renderer object.
+-- The match ball is not a part you can find in the workspace: every character
+-- carries a small transparent Part called "Ball" which is a hitbox and a red
+-- herring. The real one exists only through its renderer, and that renderer's
+-- GetMovementState is the same table the game's own keeper prediction takes.
 
 local predict = { bits = nil, renderer = nil, world = nil, worldAt = 0 }
 
@@ -169,13 +148,20 @@ function predict.ball()
 	end
 	local ok, state = pcall(renderer.GetMovementState)
 	if not ok or type(state) ~= "table" or not state.Position then
-		return nil
+		return nil, renderer
 	end
 	return state, renderer
 end
 
--- The collision world the simulator bounces against. Rebuilt rarely: it is a
--- walk of the map's geometry and the map does not change mid-match.
+function predict.owner()
+	local _, renderer = predict.ball()
+	if not renderer then
+		return nil
+	end
+	local ok, userId = pcall(renderer.GetOwnedUserId)
+	return ok and userId or nil
+end
+
 function predict.boundary()
 	local bits = predict.bits
 	local now = os.clock()
@@ -192,7 +178,7 @@ end
 function predict.goal(team)
 	local data = Workspace:FindFirstChild("Map")
 	data = data and data:FindFirstChild("Data")
-	local model = data and data:FindFirstChild(team)
+	local model = team and data and data:FindFirstChild(team)
 	local goal = model and model:FindFirstChild("Goal")
 	return goal and goal:IsA("BasePart") and goal or nil
 end
@@ -206,8 +192,16 @@ function predict.myTeam()
 	return ok and name or nil
 end
 
--- Where and when the ball crosses a goal, straight from the game's own solver.
--- Returns nil when it is not going in, which is most of the time.
+function predict.theirTeam()
+	local mine = predict.myTeam()
+	if not mine then
+		return nil
+	end
+	return mine == "Team1" and "Team2" or "Team1"
+end
+
+-- Where and when the ball crosses a goal, from the game's own solver, spin and
+-- bounce included. Nil when it is not going in, which is most of the time.
 function predict.crossing(state, team)
 	local bits = predict.bits
 	local goal = predict.goal(team)
@@ -215,69 +209,322 @@ function predict.crossing(state, team)
 	if not goal or not world or not state then
 		return nil
 	end
-	local ok, position, at = pcall(
-		bits.GKP.GetGoalCrossing,
-		state,
-		world,
-		goal,
-		Workspace:GetServerTimeNow(),
-		5
-	)
+	local ok, position, at =
+		pcall(bits.GKP.GetGoalCrossing, state, world, goal, Workspace:GetServerTimeNow(), 5)
 	if not ok or position == nil then
 		return nil
 	end
 	return position, at
 end
 
-function predict.at(state, seconds)
-	local bits = predict.bits
-	local ok, position = pcall(bits.GKP.GetBallPositionAtTime, state, seconds)
-	return ok and position or nil
+--------------------------------------------------------------------------------
+-- reach, which is what a ball magnet actually is here
+--------------------------------------------------------------------------------
+--
+-- Gameplay.HitboxSettings is a plain table of sizes, and the game measures every
+-- touch against it with its own ContainsPoint maths rather than Roblox's
+-- Touched. That is what makes growing them safe: the usual trap, where
+-- GetTouchingParts reports nothing without a TouchTransmitter so a bigger box
+-- detects less than a small one, needs a Touched to fail at and there is none.
+--
+-- Every entry carrying a Size is scaled, rather than a list of names, so the
+-- goalkeeper's boxes are covered by the same switch as an outfield player's
+-- without having to know what the game calls them.
+
+local reach = { bits = nil, base = {}, front = nil }
+
+function reach.wire(bits)
+	reach.bits = bits
+	for key, box in pairs(bits.HitboxSettings) do
+		if type(box) == "table" and box.Size ~= nil and typeof(box.Size) ~= "function" then
+			reach.base[key] = box.Size
+		end
+	end
+	local front = bits.HitboxSettings.FrontAssist
+	if front then
+		reach.front = { IncludesShots = front.IncludesShots, TeamMode = front.TeamMode }
+	end
 end
 
-function predict.moving(state)
-	if not state then
+function reach.apply()
+	local bits = reach.bits
+	if not bits then
+		return
+	end
+	local multiplier = 1
+	if bits.F.ballMagnet == true then
+		multiplier = math.clamp(tonumber(bits.F.reachAmount) or 1, 1, 25)
+	end
+	for key, base in pairs(reach.base) do
+		local box = bits.HitboxSettings[key]
+		if box then
+			box.Size = base * multiplier
+		end
+	end
+
+	-- FrontAssist ships as IncludesShots false with TeamMode "Allies", so the
+	-- game's own assist only ever helps you collect a team mate's pass. Turning
+	-- both round is what makes loose balls and their shots stick to you.
+	local front = bits.HitboxSettings.FrontAssist
+	if front and reach.front then
+		if bits.F.autoDribble == true then
+			front.IncludesShots = true
+			front.TeamMode = "Everyone"
+		else
+			front.IncludesShots = reach.front.IncludesShots
+			front.TeamMode = reach.front.TeamMode
+		end
+	end
+end
+
+function reach.restore()
+	local bits = reach.bits
+	if not bits then
+		return
+	end
+	for key, base in pairs(reach.base) do
+		local box = bits.HitboxSettings[key]
+		if box then
+			box.Size = base
+		end
+	end
+	local front = bits.HitboxSettings.FrontAssist
+	if front and reach.front then
+		front.IncludesShots = reach.front.IncludesShots
+		front.TeamMode = reach.front.TeamMode
+	end
+end
+
+--------------------------------------------------------------------------------
+-- the box you can see
+--------------------------------------------------------------------------------
+--
+-- A reach you cannot see is a number you have to take on trust, so this draws
+-- the receive box at whatever size it currently is, adorned to the root so it
+-- follows without anything being parented into the map.
+--
+-- Deliberately NOT gethui(). Real's gethui() returns CoreGui.RobloxGui, which is
+-- a ScreenGui, and adornments and billboards nested inside a ScreenGui report
+-- themselves visible and draw absolutely nothing.
+
+local boxview = { bits = nil, holder = nil, box = nil }
+
+function boxview.home()
+	local gui = Players.LocalPlayer:FindFirstChild("PlayerGui")
+	if gui then
+		return gui
+	end
+	local fine, coreGui = pcall(function()
+		return game:GetService("CoreGui")
+	end)
+	return fine and coreGui or nil
+end
+
+function boxview.wire(bits)
+	boxview.bits = bits
+end
+
+function boxview.ensure()
+	if boxview.holder and boxview.holder.Parent then
+		return true
+	end
+	local parent = boxview.home()
+	if not parent then
 		return false
 	end
-	local velocity = state.Velocity
-	return velocity ~= nil and velocity.Magnitude > 4
+	local holder = Instance.new("Folder")
+	holder.Name = "MeridianReach"
+	holder.Parent = parent
+	boxview.holder = holder
+
+	local box = Instance.new("BoxHandleAdornment")
+	box.AlwaysOnTop = true
+	box.ZIndex = 0
+	box.Transparency = 0.82
+	box.Color3 = Color3.fromRGB(120, 210, 255)
+	box.Visible = false
+	box.Parent = holder
+	boxview.box = box
+	return true
+end
+
+function boxview.clear()
+	if boxview.holder then
+		pcall(function()
+			boxview.holder:Destroy()
+		end)
+	end
+	boxview.holder, boxview.box = nil, nil
+end
+
+function boxview.tick()
+	local bits = boxview.bits
+	if not bits then
+		return
+	end
+	if bits.F.showBox ~= true then
+		if boxview.box and boxview.box.Visible then
+			boxview.box.Visible = false
+		end
+		return
+	end
+	if not boxview.ensure() then
+		return
+	end
+
+	local root = bits.core:Root()
+	local settings = bits.HitboxSettings.Receive
+	if not root or not settings or settings.Size == nil then
+		boxview.box.Visible = false
+		return
+	end
+
+	boxview.box.Adornee = root
+	boxview.box.Size = settings.Size
+	boxview.box.CFrame = settings.CFrameOffset or CFrame.new()
+	boxview.box.Visible = true
 end
 
 --------------------------------------------------------------------------------
--- the gun, and the one thing this game trusts the client about
+-- legs
+--------------------------------------------------------------------------------
+
+local boost = { bits = nil, on = false, unlocked = false, slow = nil }
+
+function boost.wire(bits)
+	boost.bits = bits
+	local constants = bits.ActionMovement.Constants
+	boost.slow = {
+		BallCarrierJogSpeedMultiplier = constants.BallCarrierJogSpeedMultiplier,
+		BallCarrierRunSpeedMultiplier = constants.BallCarrierRunSpeedMultiplier,
+		ChargingWalkSpeedMultiplier = constants.ChargingWalkSpeedMultiplier,
+	}
+end
+
+-- The actor is the PLAYER for stamina and the CHARACTER for a boost, inside the
+-- same module. Passing one where the other belongs fails silently both ways.
+function boost.actor()
+	local bits = boost.bits
+	local character = bits.core:Character()
+	if not character then
+		return nil, nil
+	end
+	local ok, actor = pcall(bits.Actors.GetFromCharacter, character)
+	return ok and actor or nil, character
+end
+
+-- Carrying the ball costs 20% of your run speed and charging a shot costs half,
+-- and both are plain numbers in ActionMovement.Constants rather than anything
+-- that passes through Movement.SetMultiplier. Which is exactly why hooking
+-- SetMultiplier looked correct and did nothing at all about carrying the ball.
+function boost.slowdown()
+	local bits = boost.bits
+	if not bits or not boost.slow then
+		return
+	end
+	local constants = bits.ActionMovement.Constants
+	if bits.F.noSlowdown == true then
+		constants.BallCarrierJogSpeedMultiplier = 1
+		constants.BallCarrierRunSpeedMultiplier = 1
+		constants.ChargingWalkSpeedMultiplier = 1
+	else
+		for key, value in pairs(boost.slow) do
+			constants[key] = value
+		end
+	end
+end
+
+function boost.tick()
+	local bits = boost.bits
+	if not bits then
+		return
+	end
+	local F, Sprint = bits.F, bits.Sprint
+	boost.slowdown()
+
+	local actor, character = boost.actor()
+	if actor then
+		if F.foreverStamina == true then
+			pcall(Sprint.SetStaminaMultiplier, 0)
+			pcall(Sprint.SetUnlimitedStamina, actor, "Meridian", true)
+			boost.on = true
+		elseif boost.on then
+			pcall(Sprint.SetStaminaMultiplier, 1)
+			pcall(Sprint.ClearUnlimitedStaminaSource, "Meridian")
+			boost.on = false
+		end
+
+		-- ForceSprint and no SpeedMultiplier, because the multiplier is not ours
+		-- to set: ApplyBoost with SpeedMultiplier 2 still leaves WalkSpeed at
+		-- 25.6, and writing Humanoid.WalkSpeed = 40 decays back to 16 in three
+		-- seconds. What the server does not own is whether you are sprinting.
+		if F.alwaysSprint == true and character then
+			pcall(Sprint.ApplyBoost, character, {
+				ForceSprint = true,
+				NoStaminaConsumption = true,
+				SpeedMultiplier = 1,
+				DurationSeconds = 2,
+			})
+		end
+	end
+
+	-- The cursor is freed while the hub window is OPEN and locked again the
+	-- moment it closes. This game pins it to the centre of the screen because
+	-- that is how you aim, so a switch that frees it all match takes the game
+	-- away in order to fix a menu.
+	local open = false
+	if bits.window and bits.window.GetState then
+		local fine, state = pcall(bits.window.GetState)
+		open = fine and state == true
+	end
+	local wantFree = open and F.freeMouse ~= false
+	if wantFree ~= boost.unlocked then
+		boost.unlocked = wantFree
+		pcall(bits.MouseController.SetUnlocked, "Meridian", wantFree)
+	end
+end
+
+function boost.restore()
+	local bits = boost.bits
+	if not bits then
+		return
+	end
+	if boost.slow then
+		for key, value in pairs(boost.slow) do
+			bits.ActionMovement.Constants[key] = value
+		end
+	end
+	pcall(bits.Sprint.SetStaminaMultiplier, 1)
+	pcall(bits.Sprint.ClearUnlimitedStaminaSource, "Meridian")
+	pcall(bits.MouseController.SetUnlocked, "Meridian", false)
+	local _, character = boost.actor()
+	if character then
+		pcall(bits.Sprint.ClearBoost, character)
+	end
+end
+
+--------------------------------------------------------------------------------
+-- the gun
 --------------------------------------------------------------------------------
 --
--- Every gadget that shoots sends the server an AimRay:
+-- Every gadget that shoots sends an AimRay carrying ClientHit = {Kind, UserId,
+-- Position, RootLocalPosition}, and HitScan.CleanClientHit checks only the shape
+-- of it: that UserId is an integer and the positions are finite. It never asks
+-- whether the ray reaches that player. The one geometric rule in the whole path
+-- is that the ray origin sits within twelve studs of your own character.
 --
---     {Origin, Direction, CameraCFrame, TargetPosition,
---      ClientHit = {Kind = "Character", UserId, Position, RootLocalPosition}}
---
--- HitScan.CleanClientHit is the only thing standing between that and the
--- server's damage, and all it checks is the SHAPE - that UserId is an integer
--- and the two positions are finite Vector3s. It never asks whether the ray
--- actually reaches that player, whether they are in front of you, or how far
--- away they are. The single geometric rule in the whole path is that your ray
--- Origin must be within 12 studs of your own character, and if it is not the
--- server just snaps the origin back to you and carries on.
---
--- So the client names who it hit and the server believes it.
---
--- This does NOT forge a packet. ItemCommands.FireEquipped is a plain function
--- on a shared module table, called with the ray one line before FireServer, so
--- the aim is rewritten on the way past and the game still builds the ActionId,
--- the ShotTime, the equip id and the sequencing itself. Nothing here has to
--- know how any of that works, which is why it keeps working when the game
--- changes. Core:Override puts the original function back when the hub unloads.
+-- The ray is rewritten on its way past ItemCommands.FireEquipped rather than
+-- forged, so the game still builds the action id, the shot time and the
+-- sequencing. Copied, not edited: the caller reuses its own ray to draw the
+-- muzzle flash, and writing through it would point the visuals somewhere the
+-- player never aimed.
 
-local aim = { bits = nil, last = nil, firedAt = 0, shots = 0 }
+local aim = { bits = nil, last = nil, shots = 0 }
 
 function aim.wire(bits)
 	aim.bits = bits
 end
 
--- Whoever the shot should really go to. Scored by angle from where the camera
--- is already pointing, so it takes the person you were roughly looking at
--- rather than snapping across the pitch at somebody behind you.
 function aim.pick()
 	local bits = aim.bits
 	local F = bits.F
@@ -288,7 +535,7 @@ function aim.pick()
 	end
 
 	local mine = predict.myTeam()
-	local reach = tonumber(F.aimRange) or 400
+	local far = tonumber(F.aimRange) or 400
 	local nearestToMe = F.aimTarget == "Nearest To You"
 	local best, bestScore = nil, nil
 
@@ -300,11 +547,9 @@ function aim.pick()
 			if part and humanoid and humanoid.Health > 0 then
 				local ok, team = pcall(bits.ActorTeams.GetActorTeamName, player)
 				team = ok and team or nil
-				-- Unknown team counts as fair game only when we do not know our
-				-- own either; shooting a team mate is worse than not shooting.
 				local enemy = F.aimEnemiesOnly == false or mine == nil or team ~= mine
 				local distance = (part.Position - root.Position).Magnitude
-				if enemy and distance <= reach then
+				if enemy and distance <= far then
 					local score = distance
 					if not nearestToMe then
 						local toward = part.Position - camera.CFrame.Position
@@ -334,10 +579,6 @@ function aim.rewrite(ray)
 		return ray
 	end
 
-	-- Copied rather than edited. The caller keeps a reference to the ray it
-	-- built and uses it again for its own visuals; writing through it would
-	-- make the muzzle flash point somewhere the player never aimed, which is
-	-- the difference between a shot that lands and a shot that is obvious.
 	local out = table.clone(ray)
 	local hit = part.Position
 	out.ClientHit = {
@@ -355,224 +596,21 @@ function aim.rewrite(ray)
 		end
 	end
 
-	aim.last, aim.firedAt = player.DisplayName, os.clock()
+	aim.last = player.DisplayName
 	aim.shots = aim.shots + 1
-	journal.note("gun aimed at " .. player.Name)
 	return out
-end
-
---------------------------------------------------------------------------------
--- reach, and it is the one this game is built to give away
---------------------------------------------------------------------------------
---
--- Gameplay.HitboxSettings is a plain table of sizes on a shared module, and the
--- game measures every touch against it with its own Luau maths rather than with
--- Roblox's Touched. That matters, because the usual trap with a grown hitbox is
--- that BasePart:GetTouchingParts reports nothing without a TouchTransmitter, so
--- a bigger box detects less than a small one. None of that applies here:
--- nothing is touching anything, it is ContainsPoint against a Size.
---
---     Receive          5.5 x 5.25 x 5.5    taking the ball at your feet
---     AirReceive       5   x 9    x 5      taking it out of the air
---     AssistedReceive  8   x 9    x 8      the game's own generous one
---     Kick             6   x 7    x 7      how near the ball must be to strike
---     SlideTackle      5   x 5    x 5      the sliding challenge
---
--- The sizes are scaled in place and put back on unload. FrontAssist is a
--- separate thing worth having: it ships as IncludesShots = false with TeamMode
--- "Allies", so the assist only ever helps you receive a team mate's pass.
--- Turning both around is what makes it an interception.
-
-local reach = { bits = nil, base = {}, front = nil }
-
-reach.keys = { "Receive", "AirReceive", "AssistedReceive", "Kick", "SlideTackle" }
-
-function reach.wire(bits)
-	reach.bits = bits
-	local settings = bits.HitboxSettings
-	for _, key in ipairs(reach.keys) do
-		local box = settings[key]
-		if box and box.Size then
-			reach.base[key] = box.Size
-		end
-	end
-	local front = settings.FrontAssist
-	if front then
-		reach.front = { IncludesShots = front.IncludesShots, TeamMode = front.TeamMode }
-	end
-end
-
-function reach.apply()
-	local bits = reach.bits
-	if not bits then
-		return
-	end
-	local settings = bits.HitboxSettings
-	local multiplier = 1
-	if bits.F.reachOn == true then
-		multiplier = math.clamp(tonumber(bits.F.reachAmount) or 1, 1, 6)
-	end
-	for _, key in ipairs(reach.keys) do
-		local box, base = settings[key], reach.base[key]
-		if box and base then
-			box.Size = base * multiplier
-		end
-	end
-
-	local front = settings.FrontAssist
-	if front and reach.front then
-		if bits.F.interceptShots == true then
-			front.IncludesShots = true
-			front.TeamMode = "Everyone"
-		else
-			front.IncludesShots = reach.front.IncludesShots
-			front.TeamMode = reach.front.TeamMode
-		end
-	end
-end
-
-function reach.restore()
-	local bits = reach.bits
-	if not bits then
-		return
-	end
-	local settings = bits.HitboxSettings
-	for _, key in ipairs(reach.keys) do
-		local box, base = settings[key], reach.base[key]
-		if box and base then
-			box.Size = base
-		end
-	end
-	local front = settings.FrontAssist
-	if front and reach.front then
-		front.IncludesShots = reach.front.IncludesShots
-		front.TeamMode = reach.front.TeamMode
-	end
-end
-
---------------------------------------------------------------------------------
--- legs
---------------------------------------------------------------------------------
---
--- Sprint keeps a boost overlay per actor - EndsAt, ForceSprint,
--- NoStaminaConsumption, SpeedMultiplier - and a stamina multiplier that scales
--- every drain in the game. Both are the game's own controls, reapplied on a
--- timer because a boost carries an expiry and the server hands out its own.
---
--- Expect the server to argue about the speed half. Characters carries
--- MovementSnapshot, MovementCorrection and MovementRehandshake remotes, which is
--- a movement anti-cheat with a correction channel, and a client that simply
--- decides it is faster is what that exists to pull back. The stamina half has
--- nothing of the kind pointed at it.
-
-local boost = { bits = nil, on = false, unlocked = false }
-
-function boost.wire(bits)
-	boost.bits = bits
-end
-
--- The actor is the PLAYER, not the character. Actors.GetFromCharacter returns
--- the Player object, and passing the character instead is why unlimited stamina
--- silently did nothing: HasUnlimitedStamina(character) is false while
--- HasUnlimitedStamina(player) is true, and neither errors.
-function boost.actor()
-	local bits = boost.bits
-	local character = bits.core:Character()
-	if not character then
-		return nil, nil
-	end
-	local ok, actor = pcall(bits.Actors.GetFromCharacter, character)
-	return ok and actor or nil, character
-end
-
-function boost.tick()
-	local bits = boost.bits
-	if not bits then
-		return
-	end
-	local F, Sprint = bits.F, bits.Sprint
-	local actor, character = boost.actor()
-	if not actor then
-		return
-	end
-
-	if F.foreverStamina == true then
-		pcall(Sprint.SetStaminaMultiplier, 0)
-		pcall(Sprint.SetUnlimitedStamina, actor, "Meridian", true)
-		boost.on = true
-	elseif boost.on then
-		pcall(Sprint.SetStaminaMultiplier, 1)
-		pcall(Sprint.ClearUnlimitedStaminaSource, "Meridian")
-		boost.on = false
-	end
-
-	-- ForceSprint, and no SpeedMultiplier, because the multiplier is not ours to
-	-- set. Measured: ApplyBoost with SpeedMultiplier 2 leaves WalkSpeed at 25.6,
-	-- which is just what sprinting is worth, and writing Humanoid.WalkSpeed = 40
-	-- by hand decays 40 -> 20.5 -> 16 over three seconds. The server owns the
-	-- number. What it does not own is whether you are sprinting, so this holds
-	-- you at a sprint permanently instead, which is 25.6 against a walk of 16.
-	--
-	-- DurationSeconds, not EndsAt. ApplyBoost hands it to BoostStacks.Add as the
-	-- duration and the wrong key throws inside the game rather than in here.
-	-- ApplyBoost keys by CHARACTER and SetUnlimitedStamina keys by PLAYER, in
-	-- the same module. Passing one where the other belongs fails silently in
-	-- both directions: the boost lands under a key nothing reads, and the
-	-- stamina source is set for somebody who does not exist.
-	if F.alwaysSprint == true and character then
-		pcall(Sprint.ApplyBoost, character, {
-			ForceSprint = true,
-			NoStaminaConsumption = true,
-			SpeedMultiplier = 1,
-			DurationSeconds = 2,
-		})
-	end
-
-	-- The cursor is released while the hub window is OPEN and locked again the
-	-- moment it closes.
-	--
-	-- Not a toggle. This game pins the cursor to the centre of the screen
-	-- because that is how you aim, so a switch that frees it for the whole
-	-- match takes the game away in order to fix a menu.
-	local open = false
-	if bits.window and bits.window.GetState then
-		local fine, state = pcall(bits.window.GetState)
-		open = fine and state == true
-	end
-	local wantFree = open and F.freeMouse ~= false
-	if wantFree ~= boost.unlocked then
-		boost.unlocked = wantFree
-		pcall(bits.MouseController.SetUnlocked, "Meridian", wantFree)
-	end
-end
-
-function boost.restore()
-	local bits = boost.bits
-	if not bits then
-		return
-	end
-	pcall(bits.Sprint.SetStaminaMultiplier, 1)
-	pcall(bits.Sprint.ClearUnlimitedStaminaSource, "Meridian")
-	pcall(bits.MouseController.SetUnlocked, "Meridian", false)
-	local _, character = boost.actor()
-	if character then
-		pcall(bits.Sprint.ClearBoost, character)
-	end
 end
 
 --------------------------------------------------------------------------------
 -- putting it in the corner
 --------------------------------------------------------------------------------
 --
--- A shot is Kind "Kick" with PassType "Shot", and what reaches the server for a
--- kick is only Origin, Direction, CameraCFrame and IsAirborne. The ClientHit
--- and TargetPosition the guns lean on are stripped by GetLaunchAim before it
--- goes, so a kick is steered by Direction and nothing else. That is the whole
--- feature: point it at a corner instead of at whatever the camera was on.
+-- What reaches the server for a kick is only Origin, Direction, CameraCFrame and
+-- IsAirborne: GetLaunchAim strips the ClientHit and TargetPosition the guns lean
+-- on. So a shot is steered by Direction and nothing else.
 --
--- Which corner is not a preset. Every other script for this game offers "top
--- left" and "bottom right" as fixed choices; this reads where their keeper
--- actually is and takes the far post.
+-- Which corner is not a preset. The other scripts for this game offer a fixed
+-- "top left"; this reads where their keeper is standing as you strike.
 
 local strike = { bits = nil, last = nil }
 
@@ -580,15 +618,13 @@ function strike.wire(bits)
 	strike.bits = bits
 end
 
--- The four corners of the mouth, inset so a shot is not scraping the frame.
 function strike.corners(goal)
 	local half = goal.Size * 0.5
 	local inset = 3
 	local out = {}
 	for _, sx in ipairs({ -1, 1 }) do
 		for _, sy in ipairs({ -1, 1 }) do
-			out[#out + 1] = goal.Position
-				+ Vector3.new((half.X - inset) * sx, (half.Y - inset) * sy, 0)
+			out[#out + 1] = goal.Position + Vector3.new((half.X - inset) * sx, (half.Y - inset) * sy, 0)
 		end
 	end
 	return out
@@ -609,14 +645,9 @@ function strike.keeperAt(team)
 	return nil
 end
 
--- The corner their keeper is furthest from.
 function strike.target()
-	local mine = predict.myTeam()
-	if not mine then
-		return nil
-	end
-	local theirs = mine == "Team1" and "Team2" or "Team1"
-	local goal = predict.goal(theirs)
+	local theirs = predict.theirTeam()
+	local goal = theirs and predict.goal(theirs)
 	if not goal then
 		return nil
 	end
@@ -658,464 +689,235 @@ function strike.rewrite(command)
 	aimed.Direction = offset.Unit
 	out.AimDirection = aimed
 	strike.last = corner
-	journal.note("shot aimed at a corner")
+	journal.note("shot sent at a corner")
 	return out
 end
 
 --------------------------------------------------------------------------------
--- what gets drawn
+-- playing for you
 --------------------------------------------------------------------------------
 --
--- The holder goes in gethui() rather than PlayerGui, and it is re-made whenever
--- it disappears. Both halves of that were paid for in another game: PlayerGui
--- there was swept clean of anything the game had not put in it, and an ESP that
--- is off for the rest of the night with its switch still reading on is worse
--- than one that was never built.
-
-local marks = { people = {}, boxes = {}, path = {}, pins = {}, holder = nil }
-
--- NOT gethui(), and this is the bug that made the whole thing invisible while
--- every property read back correct.
+-- Each of these presses the game's own buttons. Shoot, Pass and SlideTackleInput
+-- are the client modules the keyboard already talks to, so charge timing, action
+-- ids and sequencing keep coming from the game.
 --
--- Real's gethui() returns CoreGui.RobloxGui, which is a ScreenGui. A
--- BillboardGui nested inside a ScreenGui does not render at all - it takes an
--- Adornee, reports Enabled true, and draws nothing. Checking the pool and
--- finding "12 of 30 lit" therefore proves nothing, which is exactly how this
--- shipped: the flags were watched instead of the screen.
---
--- A BillboardGui has to hang off PlayerGui or CoreGui directly.
-function marks.home()
-	local gui = Players.LocalPlayer:FindFirstChild("PlayerGui")
-	if gui then
-		return gui
-	end
-	local fine, coreGui = pcall(function()
-		return game:GetService("CoreGui")
-	end)
-	return fine and coreGui or nil
+-- Everything is gated. An action asked for twice a second is the thing that gets
+-- accounts removed, so each carries its own cooldown and none of them fire while
+-- the character is down or the match has not started.
+
+local auto = { bits = nil, next = {}, charging = nil }
+
+function auto.wire(bits)
+	auto.bits = bits
 end
 
-function marks.label(parent)
-	local billboard = Instance.new("BillboardGui")
-	billboard.Size = UDim2.fromOffset(260, 32)
-	billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
-	billboard.AlwaysOnTop = true
-	billboard.Enabled = false
-	billboard.Parent = parent
-
-	local text = Instance.new("TextLabel")
-	text.BackgroundTransparency = 1
-	text.Size = UDim2.fromScale(1, 1)
-	text.Font = Enum.Font.GothamMedium
-	text.TextSize = 16
-	text.TextStrokeTransparency = 0.4
-	text.RichText = true
-	text.Parent = billboard
-
-	return { billboard = billboard, text = text, target = nil }
-end
-
-function marks.person(parent)
-	local slot = marks.label(parent)
-	local highlight = Instance.new("Highlight")
-	highlight.FillTransparency = 0.75
-	highlight.OutlineTransparency = 0.1
-	highlight.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
-	highlight.Enabled = false
-	highlight.Parent = parent
-	slot.highlight = highlight
-	return slot
-end
-
--- A path segment, and a pin standing on the goal line.
---
--- Both are CylinderHandleAdornment rather than anything drawn on the screen. A
--- 2D line has to be re-projected every time the camera moves; an adornment is
--- real geometry that turns with the world by itself and still draws through
--- walls. Adorned to Terrain, its CFrame is world space, so nothing has to be
--- parented into the map.
-function marks.rod(parent, radius)
-	local rod = Instance.new("CylinderHandleAdornment")
-	rod.Radius = radius
-	rod.AlwaysOnTop = true
-	rod.ZIndex = 0
-	rod.Transparency = 0.3
-	rod.Visible = false
-	rod.Adornee = Workspace.Terrain
-	rod.Parent = parent
-	return rod
-end
-
-function marks.ensure(people, boxes, path)
-	local holder = marks.holder
-	if holder and holder.Parent then
-		return true
-	end
-	local parent = marks.home()
-	if not parent then
+function auto.due(key, seconds)
+	local now = os.clock()
+	if now < (auto.next[key] or 0) then
 		return false
 	end
-
-	-- Rebuilt from empty rather than added to. A second pass that appended
-	-- would leave the loops holding slots inside a destroyed folder, and the
-	-- count of what is drawn would stop meaning anything.
-	marks.people, marks.boxes, marks.path, marks.pins = {}, {}, {}, {}
-
-	local made = Instance.new("Folder")
-	made.Name = "MeridianMarks"
-	made.Parent = parent
-	marks.holder = made
-
-	for _ = 1, people do
-		marks.people[#marks.people + 1] = marks.person(made)
-	end
-	for _ = 1, boxes do
-		marks.boxes[#marks.boxes + 1] = marks.label(made)
-	end
-	for _ = 1, path do
-		marks.path[#marks.path + 1] = marks.rod(made, 0.22)
-	end
-	for _ = 1, 2 do
-		marks.pins[#marks.pins + 1] = { rod = marks.rod(made, 0.55), slot = marks.label(made) }
-	end
+	auto.next[key] = now + seconds
 	return true
 end
 
-function marks.clear()
-	if marks.holder then
-		pcall(function()
-			marks.holder:Destroy()
-		end)
-	end
-	marks.holder = nil
-	marks.people, marks.boxes, marks.path, marks.pins = {}, {}, {}, {}
-end
-
-function marks.hideFrom(pool, index)
-	for slot = index, #pool do
-		local mark = pool[slot]
-		if not mark.billboard.Enabled and not mark.target then
-			break
-		end
-		mark.billboard.Enabled = false
-		mark.billboard.Adornee = nil
-		if mark.highlight then
-			mark.highlight.Enabled = false
-			mark.highlight.Adornee = nil
-		end
-		mark.target = nil
-	end
-end
-
-function marks.rodBetween(rod, from, to, colour)
-	local offset = to - from
-	local length = offset.Magnitude
-	if length < 0.05 then
-		rod.Visible = false
-		return
-	end
-	rod.Height = length
-	rod.CFrame = CFrame.lookAt(from, to) * CFrame.new(0, 0, -length / 2)
-	rod.Color3 = colour
-	rod.Visible = true
-end
-
-marks.colours = {
-	Mine = Color3.fromRGB(120, 210, 255),
-	Theirs = Color3.fromRGB(255, 110, 110),
-	Neutral = Color3.fromRGB(232, 236, 240),
-	Keeper = Color3.fromRGB(255, 208, 84),
-	Danger = Color3.fromRGB(255, 82, 82),
-	Chance = Color3.fromRGB(120, 255, 170),
-	Box = Color3.fromRGB(190, 150, 255),
-	Landing = Color3.fromRGB(255, 255, 255),
-}
-
---------------------------------------------------------------------------------
--- the shot preview
---------------------------------------------------------------------------------
-
-local shot = { bits = nil, saidAt = 0, said = nil, live = nil }
-
-function shot.wire(bits)
-	shot.bits = bits
-end
-
-function shot.hide()
-	for _, rod in ipairs(marks.path) do
-		if rod.Visible then
-			rod.Visible = false
-		end
-	end
-	for _, pin in ipairs(marks.pins) do
-		if pin.rod.Visible then
-			pin.rod.Visible = false
-		end
-		pin.slot.billboard.Enabled = false
-		pin.slot.billboard.Adornee = nil
-	end
-	shot.live = nil
-end
-
--- One pin per goal: a post standing on the spot the ball will cross, with how
--- long until it gets there.
-function shot.pin(index, position, seconds, colour, caption)
-	local pin = marks.pins[index]
-	if not pin then
-		return
-	end
-	marks.rodBetween(pin.rod, position - Vector3.new(0, 6, 0), position + Vector3.new(0, 6, 0), colour)
-	pin.slot.text.Text = ("%s · %.1fs"):format(caption, math.max(seconds, 0))
-	pin.slot.text.TextColor3 = colour
-	pin.slot.billboard.Adornee = Workspace.Terrain
-	pin.slot.billboard.StudsOffsetWorldSpace = position + Vector3.new(0, 8, 0)
-	pin.slot.billboard.Enabled = true
-end
-
-function shot.tick()
-	local bits = shot.bits
-	if not bits then
-		return
-	end
-	local F, core = bits.F, bits.core
-
-	if F.shotPreview == false then
-		shot.hide()
-		return
-	end
-	if not marks.ensure(bits.slots.people, bits.slots.boxes, bits.slots.path) then
-		return
-	end
-
-	local state = predict.ball()
-	if not state or not predict.moving(state) then
-		shot.hide()
-		return
-	end
-
-	local mine = predict.myTeam()
-	local theirs = mine == "Team1" and "Team2" or "Team1"
-	local now = Workspace:GetServerTimeNow()
-
-	local danger, dangerAt = nil, nil
-	if mine then
-		danger, dangerAt = predict.crossing(state, mine)
-	end
-	local chance, chanceAt = nil, nil
-	if F.bothGoals ~= false and theirs then
-		chance, chanceAt = predict.crossing(state, theirs)
-	end
-
-	shot.live = danger ~= nil
-
-	if danger then
-		shot.pin(1, danger, (dangerAt or now) - now, marks.colours.Danger, "On your goal")
-	else
-		local pin = marks.pins[1]
-		if pin then
-			pin.rod.Visible = false
-			pin.slot.billboard.Enabled = false
-		end
-	end
-
-	if chance then
-		shot.pin(2, chance, (chanceAt or now) - now, marks.colours.Chance, "On their goal")
-	else
-		local pin = marks.pins[2]
-		if pin then
-			pin.rod.Visible = false
-			pin.slot.billboard.Enabled = false
-		end
-	end
-
-	-- The flight itself, sampled through the game's own simulator so bounces
-	-- and curve are in it rather than a straight line that lies about both.
-	if F.drawFlight ~= false then
-		local points = math.clamp(math.floor(tonumber(F.pathDetail) or 18), 4, 40)
-		local horizon = danger and math.max((dangerAt or now) - now, 0.05)
-			or chance and math.max((chanceAt or now) - now, 0.05)
-			or 1.5
-		local step = horizon / points
-		local previous = state.Position
-		local colour = danger and marks.colours.Danger
-			or chance and marks.colours.Chance
-			or marks.colours.Neutral
-		for i = 1, points do
-			local rod = marks.path[i]
-			if not rod then
-				break
-			end
-			local here = predict.at(state, step * i)
-			if here then
-				marks.rodBetween(rod, previous, here, colour)
-				previous = here
-			else
-				rod.Visible = false
-			end
-		end
-		for i = points + 1, #marks.path do
-			if not marks.path[i].Visible then
-				break
-			end
-			marks.path[i].Visible = false
-		end
-	else
-		for _, rod in ipairs(marks.path) do
-			if rod.Visible then
-				rod.Visible = false
-			end
-		end
-	end
-
-	-- Said once per shot, not once per tick. A shot that takes a second to
-	-- arrive is one event to a person and forty to a loop.
-	if F.warnOnTarget ~= false and danger then
-		local key = tostring(state.MovementSequence or state.FlightStartedAt)
-		if shot.said ~= key and os.clock() - shot.saidAt > 1.5 then
-			shot.said, shot.saidAt = key, os.clock()
-			local seconds = math.max((dangerAt or now) - now, 0)
-			journal.note(("shot on your goal in %.1fs"):format(seconds))
-			core:Notify(Module.Name, ("Shot on your goal · %.1fs"):format(seconds), 3)
-		end
-	end
-end
-
---------------------------------------------------------------------------------
--- everybody else
---------------------------------------------------------------------------------
-
-local people = { bits = nil }
-
-function people.wire(bits)
-	people.bits = bits
-end
-
-function people.gadget(character)
-	local bits = people.bits
-	local ok, model = pcall(bits.HeldItems.FindModel, character)
-	if not ok or not model then
+function auto.ready()
+	local bits = auto.bits
+	local character = bits.core:Character()
+	local root = character and character:FindFirstChild("HumanoidRootPart")
+	local humanoid = character and character:FindFirstChildOfClass("Humanoid")
+	if not root or not humanoid or humanoid.Health <= 0 then
 		return nil
 	end
-	local id = model:GetAttribute(bits.ItemIds.AttributeName)
-	return id and tostring(id) or nil
+	if character:GetAttribute("Ragdolled") == true then
+		return nil
+	end
+	if predict.myTeam() == nil then
+		return nil
+	end
+	return character, root
 end
 
-function people.tick()
-	local bits = people.bits
-	if not bits then
-		return
-	end
-	local F, core = bits.F, bits.core
+function auto.mine()
+	local bits = auto.bits
+	return bits ~= nil and predict.owner() == bits.player.UserId
+end
 
-	if F.playerEsp ~= true then
-		marks.hideFrom(marks.people, 1)
-		return
-	end
-	local root = core:Root()
-	if not root or not marks.ensure(bits.slots.people, bits.slots.boxes, bits.slots.path) then
-		marks.hideFrom(marks.people, 1)
-		return
-	end
-
+function auto.nearest(root, wantMate)
+	local bits = auto.bits
 	local mine = predict.myTeam()
-	local reach = tonumber(F.espRange) or 900
-	local size = tonumber(F.espTextSize) or 16
-	local slot = 0
-
+	local best, bestAt = nil, math.huge
 	for _, player in ipairs(Players:GetPlayers()) do
-		if player ~= bits.player and slot < #marks.people then
+		if player ~= bits.player then
 			local character = player.Character
 			local part = character and character:FindFirstChild("HumanoidRootPart")
 			if part then
-				local distance = (part.Position - root.Position).Magnitude
-				if distance <= reach then
-					slot = slot + 1
-					local mark = marks.people[slot]
-
-					local ok, team = pcall(bits.ActorTeams.GetActorTeamName, player)
-					team = ok and team or nil
-					local keeper = character:GetAttribute("ActiveGoalkeeper") == true
-
-					local colour = marks.colours.Neutral
-					if F.teamColours ~= false and team then
-						colour = team == mine and marks.colours.Mine or marks.colours.Theirs
+				local ok, team = pcall(bits.ActorTeams.GetActorTeamName, player)
+				local same = ok and team ~= nil and team == mine
+				if ok and team ~= nil and same == wantMate then
+					local distance = (part.Position - root.Position).Magnitude
+					if distance < bestAt then
+						best, bestAt = player, distance
 					end
-					if keeper and F.markKeeper ~= false then
-						colour = marks.colours.Keeper
-					end
-
-					local text = player.DisplayName
-					if keeper and F.markKeeper ~= false then
-						text = text .. " · keeper"
-					end
-					if F.showGadget ~= false then
-						local held = people.gadget(character)
-						if held then
-							text = text .. " · " .. held
-						end
-					end
-					if F.showDistance ~= false then
-						text = ("%s · %dm"):format(text, math.floor(distance))
-					end
-
-					mark.text.Text = text
-					mark.text.TextColor3 = colour
-					mark.text.TextSize = size
-					mark.billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
-					mark.billboard.Adornee = part
-					mark.billboard.Enabled = true
-					mark.highlight.Adornee = character
-					mark.highlight.FillColor = colour
-					mark.highlight.OutlineColor = colour
-					mark.highlight.Enabled = true
-					mark.target = part
 				end
 			end
 		end
 	end
-
-	marks.hideFrom(marks.people, slot + 1)
+	return best, bestAt
 end
 
-function people.boxes()
-	local bits = people.bits
+-- A charged action is press, hold, release. Releasing on the same frame you
+-- pressed produces a tap with nothing behind it, which is why these hold.
+function auto.charge(module, seconds, why)
+	if auto.charging then
+		return
+	end
+	auto.charging = why
+	task.spawn(function()
+		pcall(module.HandleInputBegan)
+		task.wait(seconds)
+		pcall(module.HandleInputEnded)
+		journal.note(why)
+		auto.charging = nil
+	end)
+end
+
+function auto.tackle(root)
+	local bits = auto.bits
+	if bits.F.autoTackle ~= true then
+		return false
+	end
+	local carrier = predict.owner()
+	if not carrier or carrier == bits.player.UserId then
+		return false
+	end
+	local holder = Players:GetPlayerByUserId(carrier)
+	if not holder then
+		return false
+	end
+	local ok, team = pcall(bits.ActorTeams.GetActorTeamName, holder)
+	if ok and team == predict.myTeam() then
+		return false
+	end
+	local part = holder.Character and holder.Character:FindFirstChild("HumanoidRootPart")
+	if not part or (part.Position - root.Position).Magnitude > 22 then
+		return false
+	end
+	if not auto.due("tackle", 2.5) then
+		return false
+	end
+	pcall(bits.SlideTackleInput.HandleInputBegan)
+	journal.note("tackled " .. holder.Name)
+	return true
+end
+
+function auto.shoot(root)
+	local bits = auto.bits
+	if bits.F.autoGoal ~= true or not auto.mine() then
+		return false
+	end
+	local theirs = predict.theirTeam()
+	local goal = theirs and predict.goal(theirs)
+	if not goal then
+		return false
+	end
+	local far = tonumber(bits.F.shootFrom) or 120
+	if (goal.Position - root.Position).Magnitude > far then
+		return false
+	end
+	if not auto.due("shoot", 1.5) then
+		return false
+	end
+	auto.charge(bits.Shoot, 0.55, "shot at goal")
+	return true
+end
+
+function auto.pass(root)
+	local bits = auto.bits
+	if bits.F.autoPass ~= true or not auto.mine() then
+		return false
+	end
+	local _, enemyAt = auto.nearest(root, false)
+	if enemyAt > 18 then
+		return false
+	end
+	local mate = auto.nearest(root, true)
+	if not mate then
+		return false
+	end
+	if not auto.due("pass", 2) then
+		return false
+	end
+	auto.charge(bits.Pass, 0.3, "passed to " .. mate.Name)
+	return true
+end
+
+-- Diving is the keeper's whole job, and the game hands over both halves of it:
+-- GetGoalCrossing says where the ball crosses and when, GoalkeeperDive names the
+-- directions it will accept.
+function auto.keeper(root)
+	local bits = auto.bits
+	local character = bits.core:Character()
+	if bits.F.autoKeeper ~= true or not character then
+		return false
+	end
+	if character:GetAttribute("ActiveGoalkeeper") ~= true then
+		return false
+	end
+	local mine = predict.myTeam()
+	local state = predict.ball()
+	if not mine or not state then
+		return false
+	end
+	local where, at = predict.crossing(state, mine)
+	if not where then
+		return false
+	end
+	local left = (at or 0) - Workspace:GetServerTimeNow()
+	-- Too early and you dive before they have shot; too late and you are
+	-- watching it go in. Half a second out is where a dive still arrives.
+	if left > 0.55 or left < 0.05 then
+		return false
+	end
+	if not auto.due("dive", 1.2) then
+		return false
+	end
+
+	local sideways = where.X - root.Position.X
+	local name = "Middle"
+	if sideways > 4 then
+		name = "Right"
+	elseif sideways < -4 then
+		name = "Left"
+	end
+	local ok = pcall(function()
+		local choice = bits.GoalkeeperDive.GetDirectionChoiceByName(name)
+		bits.GoalkeeperDive.Run(character, choice)
+	end)
+	journal.note(("dived %s, %.2fs out (%s)"):format(name, left, ok and "ok" or "refused"))
+	return ok
+end
+
+function auto.tick()
+	local bits = auto.bits
 	if not bits then
 		return
 	end
-	local F, core = bits.F, bits.core
-
-	if F.boxEsp ~= true then
-		marks.hideFrom(marks.boxes, 1)
+	local _, root = auto.ready()
+	if not root then
 		return
 	end
-	local root = core:Root()
-	local misc = Workspace:FindFirstChild("Misc")
-	local folder = misc and misc:FindFirstChild("Items")
-	if not root or not folder or not marks.ensure(bits.slots.people, bits.slots.boxes, bits.slots.path) then
-		marks.hideFrom(marks.boxes, 1)
+	-- Order is priority: keeping it out of the net beats taking it off somebody,
+	-- which beats shooting, which beats passing.
+	if auto.keeper(root) then
 		return
 	end
-
-	local slot = 0
-	for _, thing in ipairs(folder:GetChildren()) do
-		if slot >= #marks.boxes then
-			break
-		end
-		local part = thing:IsA("BasePart") and thing
-			or (thing:IsA("Model") and (thing.PrimaryPart or thing:FindFirstChildWhichIsA("BasePart")))
-		if part then
-			slot = slot + 1
-			local mark = marks.boxes[slot]
-			mark.text.Text = ("Crate · %dm"):format(math.floor((part.Position - root.Position).Magnitude))
-			mark.text.TextColor3 = marks.colours.Box
-			mark.text.TextSize = tonumber(F.espTextSize) or 16
-			mark.billboard.StudsOffsetWorldSpace = Vector3.new(0, 3, 0)
-			mark.billboard.Adornee = part
-			mark.billboard.Enabled = true
-			mark.target = part
-		end
+	if auto.tackle(root) then
+		return
 	end
-	marks.hideFrom(marks.boxes, slot + 1)
+	if auto.shoot(root) then
+		return
+	end
+	auto.pass(root)
 end
 
 --------------------------------------------------------------------------------
@@ -1127,10 +929,6 @@ function Module.Build(ctx)
 	local F = core.Flags
 	local LocalPlayer = Players.LocalPlayer
 
-	----------------------------------------------------------------------------
-	-- the game's own modules
-	----------------------------------------------------------------------------
-
 	local Client = ReplicatedStorage:WaitForChild("Client")
 	local Modules = ReplicatedStorage:WaitForChild("Modules")
 
@@ -1138,65 +936,37 @@ function Module.Build(ctx)
 		F = F,
 		core = core,
 		player = LocalPlayer,
+		window = ctx.Window,
 		Renderer = require(Client.Gameplay.Ball.Renderer),
 		BallIds = require(Modules.Ball.BallIds),
 		GKP = require(Modules.Gameplay.GoalkeeperPrediction),
-		Physics = require(Modules.Ball.Physics),
 		ActorTeams = require(Client.Gameplay.ActorTeams),
-		HeldItems = require(Modules.Items.HeldItems),
-		ItemIds = require(Modules.Items.ItemIds),
 		HitboxSettings = require(Modules.Gameplay.HitboxSettings),
 		Sprint = require(Modules.Actions.Sprint),
 		Actors = require(Modules.Characters.Actors),
+		ActionMovement = require(Modules.Actions.ActionMovement),
 		MouseController = require(Client.MouseController),
-		Movement = require(Client.Gameplay.Player.Movement),
-		window = ctx.Window or nil,
-		slots = { people = 16, boxes = 12, path = 40 },
+		Shoot = require(Client.Gameplay.Actions.Shoot),
+		Pass = require(Client.Gameplay.Actions.Pass),
+		SlideTackleInput = require(Client.Gameplay.Actions.SlideTackleInput),
+		GoalkeeperDive = require(Modules.Actions.GoalkeeperDive),
 	}
 
 	predict.wire(bits)
-	shot.wire(bits)
-	people.wire(bits)
-	aim.wire(bits)
 	reach.wire(bits)
+	boxview.wire(bits)
 	boost.wire(bits)
+	aim.wire(bits)
 	strike.wire(bits)
+	auto.wire(bits)
 
 	core:Track(function()
 		reach.restore()
 		boost.restore()
+		boxview.clear()
 	end)
 
-	-- Everything that slows you down goes through one function.
-	--
-	-- Movement.SetMultiplier(name, {WalkSpeed = n, JumpHeight = n}) is how the
-	-- game applies every penalty it has: carrying the ball, aiming an item
-	-- down sights at 0.75, the recovery after a tackle kick. Dropping any
-	-- WalkSpeed below 1 on the way past removes all of them at once, and the
-	-- ones that are not about speed - JumpHeight, and any multiplier above 1 -
-	-- are left exactly as the game meant them.
-	local Movement = bits.Movement
-	local setMultiplier = Movement.SetMultiplier
-	core:Override(Movement, "SetMultiplier", function(name, values, ...)
-		if F.noSlowdown == true and type(values) == "table" then
-			local walk = values.WalkSpeed
-			if type(walk) == "number" and walk < 1 then
-				values = table.clone(values)
-				values.WalkSpeed = 1
-			end
-		end
-		return setMultiplier(name, values, ...)
-	end)
-
-	-- A shot is steered on the way out, the same way the guns are.
-	local ActionRemoteProtocol = require(Modules.Actions.ActionRemoteProtocol)
-	local sendAction = ActionRemoteProtocol.Send
-	core:Override(ActionRemoteProtocol, "Send", function(command)
-		return sendAction(strike.rewrite(command))
-	end)
-
-	-- The aim rewrite goes in before anything else, and comes back out on
-	-- unload because Core:Override remembers what was there.
+	-- The gun's aim, rewritten on the way past.
 	local ItemCommands = require(Modules.Items.ItemCommands)
 	local fireEquipped = ItemCommands.FireEquipped
 	core:Override(ItemCommands, "FireEquipped", function(ray, ...)
@@ -1207,67 +977,57 @@ function Module.Build(ctx)
 		return continueSequence(aim.rewrite(ray), ...)
 	end)
 
+	-- The shot's aim, the same way.
+	local ActionRemoteProtocol = require(Modules.Actions.ActionRemoteProtocol)
+	local sendAction = ActionRemoteProtocol.Send
+	core:Override(ActionRemoteProtocol, "Send", function(command)
+		return sendAction(strike.rewrite(command))
+	end)
+
 	----------------------------------------------------------------------------
 	-- loops, registered before a single tab exists
 	----------------------------------------------------------------------------
 	--
-	-- That ordering is load bearing. Maclib yields while it builds elements, and
-	-- a thread that has yielded spawns children with no capability to touch an
-	-- Instance at all, so a loop created after the tabs runs forever and draws
-	-- nothing. setthreadidentity does not fix it; registering first does.
+	-- Maclib yields while it builds elements, and a thread that has yielded
+	-- spawns children with no capability to touch an Instance, so a loop created
+	-- after the tabs runs forever and draws nothing.
 
-	marks.ensure(bits.slots.people, bits.slots.boxes, bits.slots.path)
-	core:Track(function()
-		marks.clear()
-	end)
-
-	-- The ball moves at a hundred studs a second, so the preview is a per-frame
-	-- job and not a timer. Everything else is a search and runs slowly.
-	core:Connect(RunService.Heartbeat, function()
-		shot.tick()
-	end)
-
-	core:Loop("people", 0.2, function()
-		people.tick()
-	end)
-
-	core:Loop("boxes", 0.5, function()
-		people.boxes()
-	end)
-
-	core:Loop("legs", 0.5, function()
+	core:Loop("legs", 0.4, function()
 		boost.tick()
+	end)
+
+	core:Loop("auto", 0.15, function()
+		auto.tick()
+	end)
+
+	core:Connect(RunService.Heartbeat, function()
+		boxview.tick()
 	end)
 
 	core:Loop("stats", 1, function()
 		local carried = core.Stats or {}
-		local state = predict.ball()
-		carried.Holding = state and tostring(state.Mode) or "no ball"
+		carried.Hits = aim.shots
+		carried.Holding = auto.mine() and "on the ball" or "off it"
 		core.Stats = carried
 
-		local team = predict.myTeam()
-		if not team then
+		if predict.myTeam() == nil then
 			core.Headline = "In the lobby"
-		elseif shot.live then
-			core.Headline = "Shot on your goal"
-		elseif state and predict.moving(state) then
-			core.Headline = ("Ball moving · %d studs a second"):format(math.floor(state.Velocity.Magnitude))
+		elseif auto.mine() then
+			core.Headline = "You have it"
 		else
 			core.Headline = nil
 		end
 	end)
 
 	core.Journal = journal
-	core.Predict = predict
 
 	----------------------------------------------------------------------------
 	-- anti AFK
 	----------------------------------------------------------------------------
 	--
-	-- Disabling the Idled connections is quieter than pretending to click. It
-	-- only goes one way though, and the switch says so rather than showing a
-	-- state the client is not in: Real's connection:Enable() is a no-op on a
-	-- native connection and leaves Enabled false however happily it returns.
+	-- Only goes one way: Real's connection:Enable() is a no-op on a native
+	-- connection and leaves Enabled false however happily it returns.
+
 	core.SetAntiAfk = function(on)
 		local restored = true
 		local ok = pcall(function()
@@ -1286,46 +1046,182 @@ function Module.Build(ctx)
 	end
 
 	task.spawn(function()
-		if F.antiAfk == false then
-			return
-		end
-		local ok = core.SetAntiAfk(true)
-		if not ok then
-			core:Connect(LocalPlayer.Idled, function()
-				if F.antiAfk == false then
-					return
-				end
-				pcall(function()
-					local VirtualUser = game:GetService("VirtualUser")
-					VirtualUser:CaptureController()
-					VirtualUser:ClickButton2(Vector2.new())
-				end)
-			end)
+		if F.antiAfk ~= false then
+			core.SetAntiAfk(true)
 		end
 	end)
 
 	----------------------------------------------------------------------------
-	-- the interface, and it is last on purpose
+	-- the interface
 	----------------------------------------------------------------------------
 
+	local ballTab = tabGroup:Tab({ Name = "Ball", Image = "rbxassetid://10723407389" })
+	local bodyTab = tabGroup:Tab({ Name = "Body", Image = "rbxassetid://10723415903" })
 	local aimTab = tabGroup:Tab({ Name = "Aim", Image = "rbxassetid://10734949856" })
-	local reachTab = tabGroup:Tab({ Name = "Body", Image = "rbxassetid://10723415903" })
-	local matchTab = tabGroup:Tab({ Name = "Match", Image = "rbxassetid://10723407389" })
-	local playersTab = tabGroup:Tab({ Name = "Players", Image = "rbxassetid://10747373176" })
-	local playerTab = tabGroup:Tab({ Name = "Session", Image = "rbxassetid://10734898355" })
 
+	local ballLeft = ballTab:Section({ Side = "Left" })
+	local ballRight = ballTab:Section({ Side = "Right" })
+	local bodyLeft = bodyTab:Section({ Side = "Left" })
+	local bodyRight = bodyTab:Section({ Side = "Right" })
 	local aimLeft = aimTab:Section({ Side = "Left" })
-	local reachLeft = reachTab:Section({ Side = "Left" })
-	local reachRight = reachTab:Section({ Side = "Right" })
-	local matchLeft = matchTab:Section({ Side = "Left" })
-	local matchRight = matchTab:Section({ Side = "Right" })
-	local playersLeft = playersTab:Section({ Side = "Left" })
-	local playersRight = playersTab:Section({ Side = "Right" })
-	local sessionLeft = playerTab:Section({ Side = "Left" })
+
+	---------------------------------------------------------------- ball · left
+
+	ballLeft:Header({ Text = "The Ball" })
+
+	ballLeft:Toggle({
+		Name = "Ball Magnet",
+		Default = false,
+		Callback = function(state)
+			F.ballMagnet = state
+			reach.apply()
+		end,
+	}, "ballMagnet")
+
+	ballLeft:Slider({
+		Name = "How Much Bigger",
+		Default = 6,
+		Minimum = 1,
+		Maximum = 25,
+		DisplayMethod = "Value",
+		Precision = 1,
+		Callback = function(value)
+			F.reachAmount = value
+			reach.apply()
+		end,
+	}, "reachAmount")
+
+	ballLeft:Toggle({
+		Name = "Show The Box",
+		Default = false,
+		Callback = function(state)
+			F.showBox = state
+		end,
+	}, "showBox")
+
+	ballLeft:Toggle({
+		Name = "Auto Dribble",
+		Default = false,
+		Callback = function(state)
+			F.autoDribble = state
+			reach.apply()
+		end,
+	}, "autoDribble")
+
+	--------------------------------------------------------------- ball · right
+
+	ballRight:Header({ Text = "Playing For You" })
+
+	ballRight:Toggle({
+		Name = "Auto Tackle",
+		Default = false,
+		Callback = function(state)
+			F.autoTackle = state
+		end,
+	}, "autoTackle")
+
+	ballRight:Toggle({
+		Name = "Auto Goal",
+		Default = false,
+		Callback = function(state)
+			F.autoGoal = state
+		end,
+	}, "autoGoal")
+
+	ballRight:Slider({
+		Name = "Shoot From",
+		Default = 120,
+		Minimum = 40,
+		Maximum = 300,
+		DisplayMethod = "Value",
+		Precision = 0,
+		Callback = function(value)
+			F.shootFrom = value
+		end,
+	}, "shootFrom")
+
+	ballRight:Toggle({
+		Name = "Auto Pass",
+		Default = false,
+		Callback = function(state)
+			F.autoPass = state
+		end,
+	}, "autoPass")
+
+	ballRight:Toggle({
+		Name = "Auto Goalkeeper",
+		Default = false,
+		Callback = function(state)
+			F.autoKeeper = state
+		end,
+	}, "autoKeeper")
+
+	---------------------------------------------------------------- body · left
+
+	bodyLeft:Header({ Text = "Legs" })
+
+	bodyLeft:Toggle({
+		Name = "No Slowdown",
+		Default = false,
+		Callback = function(state)
+			F.noSlowdown = state
+			boost.slowdown()
+		end,
+	}, "noSlowdown")
+
+	bodyLeft:Toggle({
+		Name = "Never Run Out",
+		Default = false,
+		Callback = function(state)
+			F.foreverStamina = state
+		end,
+	}, "foreverStamina")
+
+	bodyLeft:Toggle({
+		Name = "Always Sprint",
+		Default = false,
+		Callback = function(state)
+			F.alwaysSprint = state
+			if not state then
+				boost.restore()
+			end
+		end,
+	}, "alwaysSprint")
+
+	--------------------------------------------------------------- body · right
+
+	bodyRight:Header({ Text = "Session" })
+
+	bodyRight:Toggle({
+		Name = "Free Mouse",
+		Default = true,
+		Callback = function(state)
+			F.freeMouse = state
+		end,
+	}, "freeMouse")
+
+	bodyRight:Toggle({
+		Name = "Anti AFK",
+		Default = true,
+		Callback = function(state)
+			F.antiAfk = state
+			core.SetAntiAfk(state)
+		end,
+	}, "antiAfk")
 
 	----------------------------------------------------------------- aim · left
 
-	aimLeft:Header({ Text = "Guns" })
+	aimLeft:Header({ Text = "Aim" })
+
+	aimLeft:Toggle({
+		Name = "Aim For The Corner",
+		Default = false,
+		Callback = function(state)
+			F.cornerAim = state
+		end,
+	}, "cornerAim")
+
+	aimLeft:Divider()
 
 	aimLeft:Toggle({
 		Name = "Silent Aim",
@@ -1354,16 +1250,6 @@ function Module.Build(ctx)
 		end,
 	}, "aimEnemiesOnly")
 
-	aimLeft:Divider()
-
-	aimLeft:Toggle({
-		Name = "Aim For The Corner",
-		Default = false,
-		Callback = function(state)
-			F.cornerAim = state
-		end,
-	}, "cornerAim")
-
 	aimLeft:Slider({
 		Name = "Aim Range",
 		Default = 400,
@@ -1376,255 +1262,15 @@ function Module.Build(ctx)
 		end,
 	}, "aimRange")
 
-	--------------------------------------------------------------- reach · left
-
-	reachLeft:Header({ Text = "Reach" })
-
-	reachLeft:Toggle({
-		Name = "Longer Reach",
-		Default = false,
-		Callback = function(state)
-			F.reachOn = state
-			reach.apply()
-		end,
-	}, "reachOn")
-
-	reachLeft:Slider({
-		Name = "How Much Further",
-		Default = 2,
-		Minimum = 1,
-		Maximum = 6,
-		DisplayMethod = "Value",
-		Precision = 1,
-		Callback = function(value)
-			F.reachAmount = value
-			reach.apply()
-		end,
-	}, "reachAmount")
-
-	reachLeft:Toggle({
-		Name = "Take Their Shots",
-		Default = false,
-		Callback = function(state)
-			F.interceptShots = state
-			reach.apply()
-		end,
-	}, "interceptShots")
-
-	-------------------------------------------------------------- reach · right
-
-	reachRight:Header({ Text = "Legs" })
-
-	reachRight:Toggle({
-		Name = "Never Run Out",
-		Default = false,
-		Callback = function(state)
-			F.foreverStamina = state
-		end,
-	}, "foreverStamina")
-
-	reachRight:Toggle({
-		Name = "No Slowdown",
-		Default = false,
-		Callback = function(state)
-			F.noSlowdown = state
-			if not state then
-				pcall(function()
-					bits.Movement.ClearMultiplier("MeridianNone")
-				end)
-			end
-		end,
-	}, "noSlowdown")
-
-	reachRight:Toggle({
-		Name = "Always Sprint",
-		Default = false,
-		Callback = function(state)
-			F.alwaysSprint = state
-			if not state then
-				boost.restore()
-			end
-		end,
-	}, "alwaysSprint")
-
-	reachRight:Divider()
-
-	reachRight:Toggle({
-		Name = "Free Mouse",
-		Default = true,
-		Callback = function(state)
-			F.freeMouse = state
-		end,
-	}, "freeMouse")
-
-	--------------------------------------------------------------- match · left
-
-	matchLeft:Header({ Text = "The Shot" })
-
-	matchLeft:Toggle({
-		Name = "Shot Preview",
-		Default = true,
-		Callback = function(state)
-			F.shotPreview = state
-			if not state then
-				shot.hide()
-			end
-		end,
-	}, "shotPreview")
-
-	matchLeft:Toggle({
-		Name = "Draw The Flight",
-		Default = true,
-		Callback = function(state)
-			F.drawFlight = state
-		end,
-	}, "drawFlight")
-
-	matchLeft:Toggle({
-		Name = "Both Goals",
-		Default = true,
-		Callback = function(state)
-			F.bothGoals = state
-		end,
-	}, "bothGoals")
-
-	matchLeft:Slider({
-		Name = "Path Detail",
-		Default = 18,
-		Minimum = 4,
-		Maximum = 40,
-		DisplayMethod = "Value",
-		Precision = 0,
-		Callback = function(value)
-			F.pathDetail = value
-		end,
-	}, "pathDetail")
-
-	-------------------------------------------------------------- match · right
-
-	matchRight:Header({ Text = "Warnings" })
-
-	matchRight:Toggle({
-		Name = "Warn On Target",
-		Default = true,
-		Callback = function(state)
-			F.warnOnTarget = state
-		end,
-	}, "warnOnTarget")
-
-	------------------------------------------------------------- players · left
-
-	playersLeft:Header({ Text = "People" })
-
-	playersLeft:Toggle({
-		Name = "Player ESP",
-		Default = false,
-		Callback = function(state)
-			F.playerEsp = state
-		end,
-	}, "playerEsp")
-
-	playersLeft:Toggle({
-		Name = "Team Colours",
-		Default = true,
-		Callback = function(state)
-			F.teamColours = state
-		end,
-	}, "teamColours")
-
-	playersLeft:Toggle({
-		Name = "Mark The Keeper",
-		Default = true,
-		Callback = function(state)
-			F.markKeeper = state
-		end,
-	}, "markKeeper")
-
-	playersLeft:Toggle({
-		Name = "Show Their Gadget",
-		Default = true,
-		Callback = function(state)
-			F.showGadget = state
-		end,
-	}, "showGadget")
-
-	playersLeft:Toggle({
-		Name = "Show Distance",
-		Default = true,
-		Callback = function(state)
-			F.showDistance = state
-		end,
-	}, "showDistance")
-
-	------------------------------------------------------------ players · right
-
-	playersRight:Header({ Text = "On The Pitch" })
-
-	playersRight:Toggle({
-		Name = "Item Box ESP",
-		Default = false,
-		Callback = function(state)
-			F.boxEsp = state
-		end,
-	}, "boxEsp")
-
-	playersRight:Slider({
-		Name = "Max Distance",
-		Default = 900,
-		Minimum = 100,
-		Maximum = 2000,
-		DisplayMethod = "Value",
-		Precision = 0,
-		Callback = function(value)
-			F.espRange = value
-		end,
-	}, "espRange")
-
-	playersRight:Slider({
-		Name = "Text Size",
-		Default = 16,
-		Minimum = 10,
-		Maximum = 24,
-		DisplayMethod = "Value",
-		Precision = 0,
-		Callback = function(value)
-			F.espTextSize = value
-		end,
-	}, "espTextSize")
-
-	------------------------------------------------------------- session · left
-
-	sessionLeft:Header({ Text = "Session" })
-
-	sessionLeft:Toggle({
-		Name = "Anti AFK",
-		Default = true,
-		Callback = function(state)
-			F.antiAfk = state
-			local ok, restored = core.SetAntiAfk(state)
-			if not state and ok and not restored then
-				core:Notify(
-					Module.Name,
-					"Roblox will idle you out again from the next time the hub loads. It cannot be put back mid-session.",
-					7
-				)
-			end
-		end,
-	}, "antiAfk")
-
-	-- Every declared default, copied into the flags now that the controls
-	-- exist. Nothing here yields, which Build may not do.
 	seeded.apply(core)
 
 	return {
 		Tabs = {
+			Ball = ballTab,
+			Body = bodyTab,
 			Aim = aimTab,
-			Body = reachTab,
-			Match = matchTab,
-			Players = playersTab,
-			Session = playerTab,
 		},
-		Default = aimTab,
+		Default = ballTab,
 		Tips = Module.Tips,
 	}
 end
